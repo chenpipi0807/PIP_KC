@@ -1,3 +1,8 @@
+// ── 日志面板当前激活的 Tab：'audit' | 'server'
+let logActiveTab = "audit";
+// 日志自动刷新定时器
+let logAutoTimer = null;
+
 const state = {
   config: null,
   currentPath: "",
@@ -12,26 +17,18 @@ const state = {
   refreshTimer: null,
 };
 
-const runtime = {
-  desktop: Boolean(window.pipAPI && typeof window.pipAPI.getConfig === "function"),
-};
-
 const DEFAULT_UPLOAD_CONCURRENCY = 8;
 const MAX_UPLOAD_CONCURRENCY = 12;
 
 const els = {
   deviceId: document.getElementById("deviceId"),
   userIdInput: document.getElementById("userIdInput"),
-  roleSelect: document.getElementById("roleSelect"),
-  hostAddressInput: document.getElementById("hostAddressInput"),
-  hostPortInput: document.getElementById("hostPortInput"),
   saveConfigBtn: document.getElementById("saveConfigBtn"),
   hostIp: document.getElementById("hostIp"),
   clientIp: document.getElementById("clientIp"),
   localIPv4: document.getElementById("localIPv4"),
   serverStatus: document.getElementById("serverStatus"),
   storageRoot: document.getElementById("storageRoot"),
-  downloadRoot: document.getElementById("downloadRoot"),
   serverUrlLabel: document.getElementById("serverUrlLabel"),
   refreshBtn: document.getElementById("refreshBtn"),
   upBtn: document.getElementById("upBtn"),
@@ -57,19 +54,19 @@ const els = {
   uploadSpeedText: document.getElementById("uploadSpeedText"),
   uploadProgressBar: document.getElementById("uploadProgressBar"),
   logPanel: document.getElementById("logPanel"),
+  logTabAudit: document.getElementById("logTabAudit"),
+  logTabServer: document.getElementById("logTabServer"),
+  logAutoRefresh: document.getElementById("logAutoRefresh"),
   refreshLogBtn: document.getElementById("refreshLogBtn"),
   closeLogBtn: document.getElementById("closeLogBtn"),
   logMeta: document.getElementById("logMeta"),
   logText: document.getElementById("logText"),
+  serverLogText: document.getElementById("serverLogText"),
   toast: document.getElementById("toast"),
 };
 
 function baseUrl() {
-  if (!runtime.desktop) {
-    return window.location.origin;
-  }
-  const { hostAddress, hostPort } = state.config || {};
-  return `http://${hostAddress}:${hostPort}`;
+  return window.location.origin;
 }
 
 function resolveUploadConcurrency(fileCount) {
@@ -89,6 +86,47 @@ function setLogPanelVisible(visible) {
   if (els.toggleLogBtn) {
     els.toggleLogBtn.textContent = state.logPanelOpen ? "隐藏日志" : "查看日志";
   }
+  if (state.logPanelOpen) {
+    startLogAutoRefresh();
+  } else {
+    stopLogAutoRefresh();
+  }
+}
+
+function setLogTab(tab) {
+  logActiveTab = tab;
+  // Tab 按钮激活状态
+  if (els.logTabAudit)  els.logTabAudit.classList.toggle("is-active",  tab === "audit");
+  if (els.logTabServer) els.logTabServer.classList.toggle("is-active", tab === "server");
+  // 显示/隐藏内容区
+  if (els.logText)       els.logText.classList.toggle("hidden",       tab !== "audit");
+  if (els.serverLogText) els.serverLogText.classList.toggle("hidden", tab !== "server");
+  // 立刻刷新当前 Tab
+  loadCurrentTabLogs(false);
+}
+
+function startLogAutoRefresh() {
+  stopLogAutoRefresh();
+  const enabled = els.logAutoRefresh ? els.logAutoRefresh.checked : true;
+  if (!enabled) return;
+  logAutoTimer = setInterval(() => {
+    if (state.logPanelOpen) loadCurrentTabLogs(false);
+  }, 3000);
+}
+
+function stopLogAutoRefresh() {
+  if (logAutoTimer) {
+    clearInterval(logAutoTimer);
+    logAutoTimer = null;
+  }
+}
+
+async function loadCurrentTabLogs(showErrorToast = true) {
+  if (logActiveTab === "audit") {
+    await loadAuditLogs(showErrorToast);
+  } else {
+    await loadServerLogs(showErrorToast);
+  }
 }
 
 async function loadAuditLogs(showErrorToast = true) {
@@ -103,11 +141,46 @@ async function loadAuditLogs(showErrorToast = true) {
     if (els.logMeta) {
       const updatedAt = new Date().toLocaleString("zh-CN", { hour12: false });
       const logFile = payload.file || "log.txt";
-      els.logMeta.textContent = `最新 ${lines.length} 条 · 更新时间 ${updatedAt} · ${logFile}`;
+      els.logMeta.textContent = `操作审计 · 最新 ${lines.length} 条 · ${updatedAt} · ${logFile}`;
     }
   } catch (error) {
     if (showErrorToast) {
       showToast(`日志读取失败：${error.message}`, "error");
+    }
+  }
+}
+
+// 级别 → CSS 类名
+const LOG_LEVEL_CLASS = { error: "log-line-error", warn: "log-line-warn", info: "log-line-info", debug: "log-line-debug" };
+
+async function loadServerLogs(showErrorToast = true) {
+  try {
+    const payload = await requestJson(`${baseUrl()}/api/server-logs?limit=200`);
+    const entries = Array.isArray(payload.entries) ? payload.entries : [];
+    if (els.serverLogText) {
+      // 清空后逐行渲染，带级别颜色
+      els.serverLogText.innerHTML = "";
+      if (!entries.length) {
+        els.serverLogText.textContent = "暂无服务器日志";
+      } else {
+        const frag = document.createDocumentFragment();
+        entries.forEach((entry) => {
+          const span = document.createElement("span");
+          span.className = LOG_LEVEL_CLASS[entry.level] || "log-line-info";
+          const levelTag = entry.level ? `[${entry.level.toUpperCase()}]` : "[INFO]";
+          span.textContent = `${entry.ts}  ${levelTag}  ${entry.msg}\n`;
+          frag.appendChild(span);
+        });
+        els.serverLogText.appendChild(frag);
+      }
+    }
+    if (els.logMeta) {
+      const updatedAt = new Date().toLocaleString("zh-CN", { hour12: false });
+      els.logMeta.textContent = `服务器运行日志 · 最新 ${entries.length} 条（内存缓冲，重启清空）· ${updatedAt}`;
+    }
+  } catch (error) {
+    if (showErrorToast) {
+      showToast(`服务器日志读取失败：${error.message}`, "error");
     }
   }
 }
@@ -146,10 +219,6 @@ function normalizeIP(value) {
   if (normalized === "localhost" || normalized === "::1") return "127.0.0.1";
   if (normalized.startsWith("::ffff:")) return normalized.slice(7);
   return normalized;
-}
-
-function isDesktopAdmin(config = {}) {
-  return normalizeIP(config.localIPv4) === normalizeIP(config.hostAddress);
 }
 
 function buildUploadItem(file, relativePath) {
@@ -281,17 +350,12 @@ function renderConfig() {
   const cfg = state.config;
   els.deviceId.textContent = cfg.deviceId;
   els.userIdInput.value = cfg.userId;
-  els.roleSelect.value = cfg.role;
-  els.hostAddressInput.value = cfg.hostAddress;
-  els.hostPortInput.value = cfg.hostPort;
   els.localIPv4.textContent = cfg.localIPv4;
   els.serverStatus.textContent = cfg.serverRunning ? "运行中" : "未运行";
   els.serverStatus.style.color = cfg.serverRunning ? "#16a34a" : "#dc2626";
   els.storageRoot.textContent = cfg.storageRoot;
-  els.downloadRoot.textContent = cfg.downloadRoot;
   const hostIp =
     (state.serverInfo && state.serverInfo.hostAddress) ||
-    cfg.hostAddress ||
     cfg.localIPv4 ||
     window.location.hostname;
   const clientIp =
@@ -300,32 +364,8 @@ function renderConfig() {
     "-";
   els.hostIp.textContent = hostIp;
   els.clientIp.textContent = clientIp;
-  const roleLabel = runtime.desktop
-    ? cfg.role === "host"
-      ? "母服务器"
-      : "子服务器"
-    : "网页访问";
-  els.serverUrlLabel.textContent = `${baseUrl()} （${roleLabel}）`;
-
-  if (runtime.desktop) {
-    els.hostAddressInput.disabled = cfg.role === "host";
-    els.roleSelect.disabled = false;
-    els.hostPortInput.disabled = false;
-    els.saveConfigBtn.textContent = "保存配置";
-  } else {
-    els.hostAddressInput.disabled = true;
-    els.hostPortInput.disabled = true;
-    els.roleSelect.disabled = true;
-    els.saveConfigBtn.textContent = "保存昵称";
-  }
-
-  if (!runtime.desktop && cfg.userId) {
-    return;
-  }
-
-  if (cfg.userId.startsWith("设备_")) {
-    showToast("建议首次修改用户ID为你的名字，便于同事识别", "");
-  }
+  els.serverUrlLabel.textContent = `${baseUrl()} （网页访问）`;
+  els.saveConfigBtn.textContent = "保存昵称";
 }
 
 function toPathParts(currentPath) {
@@ -527,10 +567,6 @@ function handleEntryActionClick(eventTarget) {
 
   const downloadTarget = eventTarget.closest("[data-download]");
   if (downloadTarget) {
-    if ((downloadTarget.dataset.entryType || "file") === "folder") {
-      showToast("已禁用文件夹下载，请使用多选下载文件", "error");
-      return true;
-    }
     downloadFile(
       decodeDataValue(downloadTarget.dataset.download),
       decodeDataValue(downloadTarget.dataset.filename),
@@ -594,6 +630,9 @@ function renderListRows() {
       const actions = [];
       if (item.type === "folder") {
         actions.push(`<button class="btn" data-enter="${encodedPath}">进入</button>`);
+        actions.push(
+          `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="folder" data-filename="${encodedName}">下载zip</button>`
+        );
       } else {
         actions.push(
           `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="file" data-filename="${encodedName}">下载</button>`
@@ -665,6 +704,9 @@ function renderGridCards() {
       const actions = [];
       if (item.type === "folder") {
         actions.push(`<button class="btn" data-enter="${encodedPath}">进入</button>`);
+        actions.push(
+          `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="folder" data-filename="${encodedName}">下载zip</button>`
+        );
       } else {
         actions.push(
           `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="file" data-filename="${encodedName}">下载</button>`
@@ -742,44 +784,24 @@ async function refreshFiles() {
 }
 
 async function saveConfig() {
-  if (!runtime.desktop) {
-    const userId = (els.userIdInput.value || "").trim();
-    if (!userId) {
-      showToast("昵称不能为空", "error");
-      return;
-    }
-
-    try {
-      const profile = await requestJson(`${baseUrl()}/api/client-profile`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId }),
-      });
-      state.clientProfile = profile;
-      state.config.userId = profile.userId;
-      renderConfig();
-      showToast("昵称已保存", "success");
-    } catch (error) {
-      showToast(`昵称保存失败：${error.message}`, "error");
-    }
+  const userId = (els.userIdInput.value || "").trim();
+  if (!userId) {
+    showToast("昵称不能为空", "error");
     return;
   }
 
-  const patch = {
-    userId: (els.userIdInput.value || "").trim() || state.config.userId,
-    role: els.roleSelect.value,
-    hostAddress: (els.hostAddressInput.value || "").trim() || state.config.hostAddress,
-    hostPort: Number(els.hostPortInput.value || state.config.hostPort || 9999),
-  };
-
   try {
-    state.config = await window.pipAPI.updateConfig(patch);
-    state.isAdmin = isDesktopAdmin(state.config);
+    const profile = await requestJson(`${baseUrl()}/api/client-profile`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId }),
+    });
+    state.clientProfile = profile;
+    state.config.userId = profile.userId;
     renderConfig();
-    await refreshFiles();
-    showToast("配置已保存", "success");
+    showToast("昵称已保存", "success");
   } catch (error) {
-    showToast(`配置保存失败：${error.message}`, "error");
+    showToast(`昵称保存失败：${error.message}`, "error");
   }
 }
 
@@ -1016,15 +1038,15 @@ async function uploadSelectedFiles(uploadItems) {
 }
 
 async function downloadFile(relativePath, fileName, entryType = "file") {
-  if (entryType === "folder") {
-    showToast("已禁用文件夹下载，请使用多选下载文件", "error");
-    return false;
-  }
+  const isFolder = entryType === "folder";
+  // 文件夹下载时服务端返回 zip，确保保存文件名带 .zip 后缀
+  const resolvedFileName = isFolder ? `${fileName || "folder"}.zip` : (fileName || "");
 
-  if (!runtime.desktop) {
+  // 普通文件：直接用 <a> 标签下载
+  if (!isFolder) {
     const link = document.createElement("a");
     link.href = `${baseUrl()}/api/download?path=${encodeURIComponent(relativePath)}`;
-    link.download = fileName || "";
+    link.download = resolvedFileName;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -1032,13 +1054,29 @@ async function downloadFile(relativePath, fileName, entryType = "file") {
     return true;
   }
 
+  // 文件夹：两步走
+  // 步骤1：POST /api/zip，等待服务端打包完成，拿到 token
+  // 步骤2：用 token 构建下载 URL，用 <a> 触发下载
+  showToast("正在打包文件夹，请稍候…", "success");
   try {
-    const result = await window.pipAPI.downloadFile({
-      baseUrl: baseUrl(),
-      relativePath,
-      fileName,
+    const zipRes = await requestJson(`${baseUrl()}/api/zip`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: relativePath }),
     });
-    showToast(`下载完成：${result.savedPath}`, "success");
+    if (!zipRes.ok) {
+      showToast(`打包失败：${zipRes.message || "未知错误"}`, "error");
+      return false;
+    }
+    const { token, zipFileName } = zipRes;
+    const downloadUrl = `${baseUrl()}/api/download?token=${encodeURIComponent(token)}`;
+    const link = document.createElement("a");
+    link.href = downloadUrl;
+    link.download = zipFileName || resolvedFileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    showToast("文件夹已打包，正在下载…", "success");
     return true;
   } catch (error) {
     showToast(`下载失败：${error.message}`, "error");
@@ -1111,10 +1149,25 @@ function bindEvents() {
     const willOpen = !state.logPanelOpen;
     setLogPanelVisible(willOpen);
     if (willOpen) {
-      await loadAuditLogs(true);
+      await loadCurrentTabLogs(true);
     }
   });
-  els.refreshLogBtn.addEventListener("click", () => loadAuditLogs(true));
+  if (els.logTabAudit) {
+    els.logTabAudit.addEventListener("click", () => setLogTab("audit"));
+  }
+  if (els.logTabServer) {
+    els.logTabServer.addEventListener("click", () => setLogTab("server"));
+  }
+  if (els.logAutoRefresh) {
+    els.logAutoRefresh.addEventListener("change", () => {
+      if (els.logAutoRefresh.checked) {
+        startLogAutoRefresh();
+      } else {
+        stopLogAutoRefresh();
+      }
+    });
+  }
+  els.refreshLogBtn.addEventListener("click", () => loadCurrentTabLogs(true));
   els.closeLogBtn.addEventListener("click", () => setLogPanelVisible(false));
 
   els.upBtn.addEventListener("click", () => {
@@ -1245,31 +1298,18 @@ function bindEvents() {
 }
 
 async function bootstrap() {
-  if (runtime.desktop) {
-    state.config = await window.pipAPI.getConfig();
-    state.isAdmin = isDesktopAdmin(state.config);
-    state.serverInfo = {
-      hostAddress: state.config.hostAddress,
-      clientIP: state.config.localIPv4,
-    };
-  } else {
-    const info = await requestJson(`${baseUrl()}/api/server-info`);
-    const profile = await requestJson(`${baseUrl()}/api/client-profile`);
-    state.serverInfo = info;
-    state.clientProfile = profile;
-    state.isAdmin = Boolean(info.isAdmin);
-    state.config = {
-      deviceId: info.deviceId || "WEB_CLIENT",
-      userId: profile.userId || "访客",
-      role: "host",
-      hostAddress: info.hostAddress || window.location.hostname,
-      hostPort: Number(info.hostPort || window.location.port || 9999),
-      localIPv4: info.localIPv4 || window.location.hostname,
-      serverRunning: true,
-      storageRoot: info.storageRoot || "共享目录",
-      downloadRoot: "浏览器默认下载目录",
-    };
-  }
+  const info = await requestJson(`${baseUrl()}/api/server-info`);
+  const profile = await requestJson(`${baseUrl()}/api/client-profile`);
+  state.serverInfo = info;
+  state.clientProfile = profile;
+  state.isAdmin = Boolean(info.isAdmin);
+  state.config = {
+    deviceId: info.deviceId || "WEB_CLIENT",
+    userId: profile.userId || "访客",
+    localIPv4: info.localIPv4 || window.location.hostname,
+    serverRunning: true,
+    storageRoot: info.storageRoot || "共享目录",
+  };
 
   renderConfig();
   updateSelectionUI();

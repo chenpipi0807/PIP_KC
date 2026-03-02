@@ -1,7 +1,9 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawn } = require("child_process");
+
+// 临时 zip 文件存放在项目内的 temp 目录（避免写入系统 C 盘 Temp）
+const TEMP_DIR = path.resolve(__dirname, "..", "..", "temp");
 const { pipeline } = require("stream/promises");
 
 const Busboy = require("busboy");
@@ -14,6 +16,28 @@ const TEMP_FILE_TTL_MS = 24 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_LOG_READ_LINES = 1000;
 const RANDOM_SUFFIX_CHARS = "23456789abcdefghjkmnpqrstuvwxyz";
+
+// ── 服务器运行日志：内存环形缓冲区 ──────────────────────────────────────────
+// 捕获 console.error / console.warn / console.log，保留最新 500 条
+const SERVER_LOG_MAX = 500;
+const serverLogBuffer = []; // { ts, level, msg }
+
+function pushServerLog(level, args) {
+  const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+  if (serverLogBuffer.length >= SERVER_LOG_MAX) {
+    serverLogBuffer.shift();
+  }
+  serverLogBuffer.push({ ts: new Date().toISOString(), level, msg });
+}
+
+// 劫持 console，保留原始输出
+const _consoleError = console.error.bind(console);
+const _consoleWarn  = console.warn.bind(console);
+const _consoleLog   = console.log.bind(console);
+
+console.error = (...args) => { _consoleError(...args); pushServerLog("error", args); };
+console.warn  = (...args) => { _consoleWarn(...args);  pushServerLog("warn",  args); };
+console.log   = (...args) => { _consoleLog(...args);   pushServerLog("info",  args); };
 const HOT_WORDS = [
   "苏丹红",
   "奔波霸",
@@ -417,112 +441,115 @@ function escapePowerShellSingleQuote(value) {
   return String(value || "").replace(/'/g, "''");
 }
 
-function zipDirectoryWithPowerShell(sourceAbsolute, destinationZipAbsolute) {
-  if (process.platform !== "win32") {
-    return Promise.reject(new Error("当前环境不支持文件夹打包下载"));
-  }
-
-  const source = escapePowerShellSingleQuote(sourceAbsolute);
-  const destination = escapePowerShellSingleQuote(destinationZipAbsolute);
-  const script =
-    `$ErrorActionPreference='Stop'; ` +
-    `Compress-Archive -LiteralPath '${source}' -DestinationPath '${destination}' -Force`;
+/**
+ * 使用 archiver 包将文件夹打包为标准 ZIP 文件（跨平台，支持中文路径）
+ * 文件夹内容直接放在 ZIP 根目录下（不含外层文件夹名），与 Compress-Archive -Path "$src\*" 行为一致
+ */
+function zipDirectoryWithArchiver(sourceAbsolute, destinationZipAbsolute) {
+  const archiver = require("archiver");
+  console.log(`[ZIP-ARCHIVER] 开始打包: src=${sourceAbsolute} dst=${destinationZipAbsolute}`);
 
   return new Promise((resolve, reject) => {
-    const command = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      windowsHide: true,
+    const output = fs.createWriteStream(destinationZipAbsolute);
+    const archive = archiver("zip", { zlib: { level: 6 } });
+
+    output.on("close", () => {
+      console.log(`[ZIP-ARCHIVER] 打包完成，总字节数: ${archive.pointer()}`);
+      resolve();
     });
 
-    let stderr = "";
-    command.stderr.on("data", (chunk) => {
-      stderr += String(chunk || "");
-    });
-
-    command.on("error", (error) => {
-      reject(error);
-    });
-
-    command.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
+    archive.on("warning", (err) => {
+      if (err.code === "ENOENT") {
+        console.warn(`[ZIP-ARCHIVER] 警告: ${err.message}`);
+      } else {
+        console.error(`[ZIP-ARCHIVER] 错误(warning): ${err.message}`);
+        reject(err);
       }
-      reject(new Error(stderr.trim() || `压缩失败，退出码：${code}`));
     });
+
+    archive.on("error", (err) => {
+      console.error(`[ZIP-ARCHIVER] 错误: ${err.message}`);
+      reject(err);
+    });
+
+    archive.on("entry", (entry) => {
+      console.log(`[ZIP-ARCHIVER] 添加: ${entry.name}`);
+    });
+
+    archive.pipe(output);
+    // glob: false → 按目录递归；false 第三参为 false 表示不在 zip 内创建外层文件夹
+    archive.directory(sourceAbsolute, false);
+    archive.finalize();
   });
 }
 
 async function ensureValidZipFile(zipAbsolute) {
+  let stat;
+  try {
+    stat = await fs.promises.stat(zipAbsolute);
+  } catch (e) {
+    throw new Error(`zip 文件不存在: ${zipAbsolute}`);
+  }
+  console.log(`[ZIP-VALIDATE] zip file size: ${stat.size} bytes, path: ${zipAbsolute}`);
+  if (stat.size === 0) {
+    throw new Error("zip 文件大小为 0，压缩结果为空");
+  }
+
   const handle = await fs.promises.open(zipAbsolute, "r");
   try {
     const buffer = Buffer.alloc(4);
     const result = await handle.read(buffer, 0, 4, 0);
     if (!result.bytesRead) {
-      throw new Error("zip为空文件");
+      throw new Error("zip 为空文件（读取 0 字节）");
     }
 
     const signature = buffer.toString("hex").toLowerCase();
     const validSignatures = new Set(["504b0304", "504b0506", "504b0708"]);
     if (!validSignatures.has(signature)) {
-      throw new Error(`zip签名异常: ${signature}`);
+      throw new Error(`zip 文件头签名异常: ${signature}（期望 504b0304）`);
     }
+    console.log(`[ZIP-VALIDATE] zip signature OK: ${signature}`);
   } finally {
     await handle.close();
   }
 }
 
 async function buildFolderZip(sourceAbsolute, destinationZipAbsolute) {
-  const packers = process.platform === "win32"
-    ? [zipDirectoryWithTar, zipDirectoryWithPowerShell]
-    : [zipDirectoryWithTar];
+  console.log(`[ZIP] buildFolderZip start: src=${sourceAbsolute} dst=${destinationZipAbsolute} platform=${process.platform}`);
+
+  // 检查源目录是否存在
+  try {
+    const stat = await fs.promises.stat(sourceAbsolute);
+    if (!stat.isDirectory()) {
+      throw new Error(`源路径不是目录: ${sourceAbsolute}`);
+    }
+    const entries = await fs.promises.readdir(sourceAbsolute);
+    console.log(`[ZIP] source directory entries count: ${entries.length}, entries: ${entries.slice(0, 10).join(", ")}`);
+  } catch (e) {
+    console.error(`[ZIP] source stat error: ${e.message}`);
+    throw e;
+  }
+
+  // 使用 archiver 打包（跨平台，真正的 ZIP 格式）
+  const packers = [zipDirectoryWithArchiver];
   const errors = [];
 
   for (const pack of packers) {
+    console.log(`[ZIP] trying packer: ${pack.name}`);
     try {
-      await fs.promises.unlink(destinationZipAbsolute).catch(() => {
-        // noop
-      });
+      await fs.promises.unlink(destinationZipAbsolute).catch(() => { /* noop */ });
       await pack(sourceAbsolute, destinationZipAbsolute);
       await ensureValidZipFile(destinationZipAbsolute);
+      console.log(`[ZIP] buildFolderZip success with packer: ${pack.name}`);
       return;
     } catch (error) {
-      errors.push(`${pack.name}: ${error.message}`);
+      const msg = `${pack.name}: ${error.message}`;
+      console.error(`[ZIP] packer failed: ${msg}`);
+      errors.push(msg);
     }
   }
 
-  throw new Error(`文件夹打包失败。${errors.join("; ")}`);
-}
-
-function zipDirectoryWithTar(sourceAbsolute, destinationZipAbsolute) {
-  const parentAbsolute = path.dirname(sourceAbsolute);
-  const folderName = path.basename(sourceAbsolute);
-
-  return new Promise((resolve, reject) => {
-    const command = spawn(
-      "tar",
-      ["-a", "-c", "-f", destinationZipAbsolute, "-C", parentAbsolute, folderName],
-      {
-        windowsHide: true,
-      }
-    );
-
-    let stderr = "";
-    command.stderr.on("data", (chunk) => {
-      stderr += String(chunk || "");
-    });
-
-    command.on("error", (error) => {
-      reject(error);
-    });
-
-    command.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(stderr.trim() || `tar打包失败，退出码：${code}`));
-    });
-  });
+  throw new Error(`文件夹打包全部失败。${errors.join(" | ")}`);
 }
 
 function createLanServer({ port, staticDir, serverInfoProvider }) {
@@ -585,6 +612,13 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
     } catch (error) {
       res.status(500).json({ ok: false, message: error.message || "读取日志失败" });
     }
+  });
+
+  // 服务器运行日志（内存缓冲，包含 error/warn/info 级别）
+  app.get("/api/server-logs", (req, res) => {
+    const limit = Math.max(1, Math.min(Number(req.query.limit || 200), SERVER_LOG_MAX));
+    const entries = serverLogBuffer.slice(-limit).reverse(); // 最新在前
+    res.json({ ok: true, entries, total: serverLogBuffer.length });
   });
 
   app.get("/api/files", async (req, res) => {
@@ -863,7 +897,29 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
 
       busboy.on("file", (fieldName, file, fileInfo) => {
         const fallbackName = `file-${Date.now()}`;
-        const normalizedRelativePath = sanitizeRelativeFilePath(fileInfo.filename || "");
+        // Busboy 1.x 以 latin1 解码 multipart header 中的文件名，导致中文变成乱码。
+        // 修复：将 latin1 字符串重新按字节解释为 UTF-8；若解码后与原字符串相同（纯 ASCII）则不变。
+        // 同时兼容浏览器发送的 percent-encoded 文件名（%E4%B8%AD%E6%96%87 等）。
+        const rawFilename = fileInfo.filename || "";
+        let decodedFilename = rawFilename;
+        try {
+          const asLatin1 = Buffer.from(rawFilename, "latin1");
+          const asUtf8 = asLatin1.toString("utf8");
+          // 如果 UTF-8 解码后字节数与 latin1 字节数相同（纯 ASCII），直接用原值；
+          // 否则用 UTF-8 解码结果（中文等多字节字符）。
+          decodedFilename = asUtf8;
+        } catch {
+          // 解码失败则保留原值
+        }
+        // 兼容浏览器发送的 percent-encoded 文件名
+        try {
+          if (/%[0-9A-Fa-f]{2}/.test(decodedFilename)) {
+            decodedFilename = decodeURIComponent(decodedFilename);
+          }
+        } catch {
+          // 非合法 percent-encode，保留当前值
+        }
+        const normalizedRelativePath = sanitizeRelativeFilePath(decodedFilename);
         const safeRelativePath = normalizedRelativePath || fallbackName;
         const fileNameOnly = path.posix.basename(safeRelativePath) || fallbackName;
         const fileDirRelative = path.posix.dirname(safeRelativePath);
@@ -933,8 +989,136 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
     }
   });
 
+  // 两步下载方案：
+  // 步骤1 POST /api/zip  — 触发打包，返回临时 token
+  // 步骤2 GET  /api/download?token=xxx 或 path=xxx — 流式传输文件/zip
+  //
+  // 这样浏览器端可以用 fetch() 等待打包完成获取 token，
+  // 再用 <a href="/api/download?token=xxx"> 或 Blob URL 触发真正的文件下载，
+  // 彻底解决打包耗时期间的连接超时和进度感知问题。
+
+  // 内存中维护临时 zip token 映射（进程级别，重启后失效）
+  const zipTokenMap = new Map(); // token -> { zipPath, zipFileName, expireAt }
+
+  // 定期清理过期 token（30分钟内未下载则删除临时文件）
+  setInterval(() => {
+    const now = Date.now();
+    for (const [token, info] of zipTokenMap.entries()) {
+      if (info.expireAt < now) {
+        fs.promises.unlink(info.zipPath).catch(() => { /* noop */ });
+        zipTokenMap.delete(token);
+      }
+    }
+  }, 5 * 60 * 1000);
+
+  // 步骤1：POST /api/zip — 打包文件夹，返回 token
+  app.post("/api/zip", async (req, res) => {
+    const clientIP = getClientIP(req);
+    const rawPath = String(req.body?.path || "");
+    console.log(`[API /api/zip] 收到请求: clientIP=${clientIP} rawPath="${rawPath}" body=${JSON.stringify(req.body)}`);
+    try {
+      const targetPath = rawPath;
+      if (!targetPath) {
+        console.warn(`[API /api/zip] 拒绝: 路径为空`);
+        res.status(400).json({ ok: false, message: "路径不能为空" });
+        return;
+      }
+      const { absolute } = resolveSafePath(targetPath);
+      console.log(`[API /api/zip] 解析绝对路径: "${absolute}"`);
+
+      let stat;
+      try {
+        stat = await fs.promises.stat(absolute);
+      } catch (e) {
+        console.error(`[API /api/zip] stat失败: ${e.message}`);
+        res.status(400).json({ ok: false, message: `路径不存在: ${targetPath}` });
+        return;
+      }
+      if (!stat.isDirectory()) {
+        console.warn(`[API /api/zip] 拒绝: 目标不是文件夹 isFile=${stat.isFile()}`);
+        res.status(400).json({ ok: false, message: "目标不是文件夹" });
+        return;
+      }
+
+      const folderName = path.basename(absolute);
+      const zipFileName = `${folderName}.zip`;
+      await fs.promises.mkdir(TEMP_DIR, { recursive: true });
+      const tempZipPath = path.join(
+        TEMP_DIR,
+        `pip_kuaichuan_${Date.now()}_${Math.random().toString(16).slice(2)}.zip`
+      );
+      console.log(`[API /api/zip] 开始打包: folderName="${folderName}" tempZipPath="${tempZipPath}"`);
+
+      const t0 = Date.now();
+      await buildFolderZip(absolute, tempZipPath);
+      const elapsed = Date.now() - t0;
+
+      // 打包完成后验证临时文件大小
+      const zipStat = await fs.promises.stat(tempZipPath);
+      console.log(`[API /api/zip] 打包完成: 耗时${elapsed}ms 临时zip大小=${zipStat.size}字节 文件名="${zipFileName}"`);
+
+      // 生成 token（32位随机十六进制）
+      const token = `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}${Math.random().toString(16).slice(2)}`.slice(0, 32);
+      zipTokenMap.set(token, {
+        zipPath: tempZipPath,
+        zipFileName,
+        expireAt: Date.now() + 30 * 60 * 1000, // 30 分钟有效
+      });
+      console.log(`[API /api/zip] 生成token: token=${token} 有效期30分钟`);
+
+      res.json({ ok: true, token, zipFileName });
+    } catch (error) {
+      console.error(`[API /api/zip] 异常: ${error.message}`, error.stack || "");
+      res.status(500).json({ ok: false, message: error.message || "文件夹打包失败" });
+    }
+  });
+
   app.get("/api/download", async (req, res) => {
     try {
+      // 支持 token 模式（文件夹zip下载）
+      const token = String(req.query.token || "");
+      if (token) {
+        const info = zipTokenMap.get(token);
+        if (!info) {
+          res.status(404).json({ ok: false, message: "下载链接已过期或无效，请重新点击下载" });
+          return;
+        }
+        if (info.expireAt < Date.now()) {
+          zipTokenMap.delete(token);
+          fs.promises.unlink(info.zipPath).catch(() => { /* noop */ });
+          res.status(410).json({ ok: false, message: "下载链接已过期，请重新点击下载" });
+          return;
+        }
+        // 发送前再次确认文件存在
+        let zipStat;
+        try {
+          zipStat = await fs.promises.stat(info.zipPath);
+        } catch (e) {
+          zipTokenMap.delete(token);
+          res.status(410).json({ ok: false, message: "临时文件已丢失，请重新点击下载" });
+          return;
+        }
+        console.log(`[API /api/download] token=${token} zipPath=${info.zipPath} size=${zipStat.size}`);
+        const encodedZipFileName = encodeURIComponent(info.zipFileName);
+        // 用 res.sendFile 发送，express 会正确设置 Content-Length，迅雷/IDM 等多线程下载器需要此字段
+        // 不能在 sendFile 前手动 setHeader Content-Disposition，否则 express 内部会冲突；
+        // 改用 res.attachment() 设置文件名，再 sendFile
+        res.attachment(info.zipFileName);
+        res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodedZipFileName}`);
+        res.setHeader("Content-Type", "application/zip");
+        res.setHeader("Content-Length", zipStat.size);
+        res.sendFile(info.zipPath, { dotfiles: "allow" }, (err) => {
+          if (err) {
+            console.error(`[API /api/download] sendFile error: ${err.message}`);
+          } else {
+            console.log(`[API /api/download] download complete: ${info.zipFileName}`);
+          }
+          zipTokenMap.delete(token);
+          fs.promises.unlink(info.zipPath).catch(() => { /* noop */ });
+        });
+        return;
+      }
+
       if (await cleanupExpiredTempFiles(metadata)) {
         writeJson(META_FILE, metadata);
       }
@@ -961,9 +1145,12 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
         return;
       }
 
+      // 直接下载文件夹（老路径，IPC/桌面端 fallback）
       const folderName = path.basename(absolute);
+      const zipFileName = `${folderName}.zip`;
+      await fs.promises.mkdir(TEMP_DIR, { recursive: true });
       const tempZipPath = path.join(
-        os.tmpdir(),
+        TEMP_DIR,
         `pip_kuaichuan_${Date.now()}_${Math.random().toString(16).slice(2)}.zip`
       );
 
@@ -976,12 +1163,19 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
         detail: "文件夹(zip)",
       });
 
-      res.download(tempZipPath, `${folderName}.zip`, () => {
+      const encodedZipFileName = encodeURIComponent(zipFileName);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename*=UTF-8''${encodedZipFileName}`
+      );
+      res.setHeader("Content-Type", "application/zip");
+      res.download(tempZipPath, zipFileName, () => {
         fs.promises.unlink(tempZipPath).catch(() => {
           // noop
         });
       });
     } catch (error) {
+      console.error("[PIP_KuaiChuan] /api/download error:", error);
       const status = error && error.code === "ENOENT" ? 404 : 400;
       res.status(status).json({ ok: false, message: error.message || "下载失败" });
     }
@@ -990,6 +1184,12 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
   const server = app.listen(port, "0.0.0.0", () => {
     console.log(`[PIP_KuaiChuan] LAN server started at 0.0.0.0:${port}`);
   });
+
+  // 移除上传/下载的超时限制，允许传输任意大小的文件
+  // Node.js 默认 requestTimeout=300000ms(5分钟)，大文件上传会被强制中断
+  server.requestTimeout = 0;  // 禁用请求超时（0 = 无限制）
+  server.timeout = 0;         // 禁用 socket 空闲超时
+  server.headersTimeout = 0;  // 禁用 headers 接收超时
 
   const cleanupTimer = setInterval(() => {
     cleanupExpiredTempFiles(metadata)

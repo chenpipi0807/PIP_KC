@@ -3,7 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PIP_快传</title>
+    <title>PIP_kuaichuan</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
@@ -11,46 +12,26 @@
     <div class="layout">
       <aside class="panel sidebar">
         <div class="brand">
-          <h1>PIP_快传</h1>
+          <h1>PIP_kuaichuan</h1>
           <p>局域网高速文件共享盘</p>
         </div>
 
         <section class="card">
-          <h2>设备身份</h2>
+          <h2>我的身份</h2>
           <div class="meta-row"><span>设备ID</span><code id="deviceId">-</code></div>
           <label class="field">
-            <span>用户ID（建议首次修改）</span>
+            <span>昵称（建议首次修改）</span>
             <input id="userIdInput" type="text" maxlength="32" placeholder="输入你的名字" />
           </label>
-        </section>
-
-        <section class="card">
-          <h2>网络角色</h2>
-          <label class="field">
-            <span>角色</span>
-            <select id="roleSelect">
-              <option value="client">子服务器（连接母服务器）</option>
-              <option value="host">母服务器（本机共享）</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>母服务器 IPv4</span>
-            <input id="hostAddressInput" type="text" placeholder="例如 10.250.9.82" />
-          </label>
-          <label class="field">
-            <span>端口</span>
-            <input id="hostPortInput" type="number" min="1" max="65535" />
-          </label>
-          <button id="saveConfigBtn" class="btn btn-primary">保存配置</button>
+          <button id="saveConfigBtn" class="btn btn-primary">保存昵称</button>
         </section>
 
         <section class="card compact">
-          <div class="meta-row"><span>母服务器IP</span><strong id="hostIp">-</strong></div>
+          <div class="meta-row"><span>服务器IP</span><strong id="hostIp">-</strong></div>
           <div class="meta-row"><span>当前访问IP</span><strong id="clientIp">-</strong></div>
           <div class="meta-row"><span>本机 IPv4</span><strong id="localIPv4">-</strong></div>
           <div class="meta-row"><span>服务状态</span><strong id="serverStatus">-</strong></div>
-          <div class="meta-row"><span>共享根目录</span><code id="storageRoot">-</code></div>
-          <div class="meta-row"><span>下载目录</span><code id="downloadRoot">-</code></div>
+          <div class="meta-row"><span>共享目录</span><code id="storageRoot">-</code></div>
         </section>
       </aside>
 
@@ -95,14 +76,24 @@
 
         <section id="logPanel" class="log-panel hidden">
           <div class="log-toolbar">
-            <strong>操作日志（log.txt）</strong>
+            <div class="log-tabs">
+              <button id="logTabAudit" class="log-tab is-active" data-tab="audit">操作审计日志</button>
+              <button id="logTabServer" class="log-tab" data-tab="server">服务器运行日志</button>
+            </div>
             <div class="log-toolbar-actions">
-              <button id="refreshLogBtn" class="btn">刷新日志</button>
+              <label class="log-auto-label">
+                <input id="logAutoRefresh" type="checkbox" checked />
+                自动刷新
+              </label>
+              <button id="refreshLogBtn" class="btn">刷新</button>
               <button id="closeLogBtn" class="btn">收起</button>
             </div>
           </div>
           <div id="logMeta" class="log-meta">-</div>
-          <pre id="logText" class="log-text">暂无日志</pre>
+          <!-- 操作审计日志 -->
+          <pre id="logText" class="log-text log-pane" data-pane="audit">暂无日志</pre>
+          <!-- 服务器运行日志 -->
+          <pre id="serverLogText" class="log-text log-pane hidden" data-pane="server">暂无日志</pre>
         </section>
 
         <section id="tableWrap" class="table-wrap">

@@ -3,22 +3,12 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-function resolveBaseRoot() {
-  const isElectronRuntime = Boolean(process.versions && process.versions.electron);
-  const isPackaged = isElectronRuntime && !process.defaultApp;
-
-  if (isPackaged) {
-    return path.resolve(path.dirname(process.execPath), "BASE");
-  }
-
-  return path.resolve(__dirname, "..", "..");
-}
-
-const BASE_ROOT = resolveBaseRoot();
-const APP_ROOT = path.join(BASE_ROOT, "PIP_快传");
+// Web-only 版本：
+//   源码根目录 = __dirname/..   (即 BASE/)
+//   数据根目录 = __dirname/../.. (即 D:\PIP_KC/)  下的 download/
+const APP_ROOT = path.resolve(__dirname, "..", "..", "download");
 const STORAGE_ROOT = path.join(APP_ROOT, "shared_disk");
 const DATA_ROOT = path.join(APP_ROOT, "data");
-const DOWNLOAD_ROOT = path.join(APP_ROOT, "downloads");
 const CONFIG_FILE = path.join(DATA_ROOT, "config.json");
 const META_FILE = path.join(DATA_ROOT, "file_meta.json");
 const CLIENT_PROFILE_FILE = path.join(DATA_ROOT, "client_profiles.json");
@@ -48,19 +38,12 @@ function getLocalIPv4() {
       if (virtualNamePattern.test(adapterName)) score -= 300;
       if (physicalHintPattern.test(adapterName)) score += 80;
 
-      candidates.push({
-        address,
-        score,
-      });
+      candidates.push({ address, score });
     }
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  if (candidates.length > 0) {
-    return candidates[0].address;
-  }
-
-  return "127.0.0.1";
+  return candidates.length > 0 ? candidates[0].address : "127.0.0.1";
 }
 
 function generateDeviceId() {
@@ -80,7 +63,7 @@ function generateDeviceId() {
 }
 
 function ensureDirectories() {
-  for (const dir of [BASE_ROOT, APP_ROOT, STORAGE_ROOT, DATA_ROOT, DOWNLOAD_ROOT]) {
+  for (const dir of [APP_ROOT, STORAGE_ROOT, DATA_ROOT]) {
     fs.mkdirSync(dir, { recursive: true });
   }
 }
@@ -102,9 +85,9 @@ function getDefaultConfig() {
   const deviceId = generateDeviceId();
   return {
     deviceId,
-    userId: `设备_${deviceId.slice(-6)}`,
-    role: "client",
-    hostAddress: "10.250.9.82",
+    userId: `device_${deviceId.slice(-6)}`,
+    role: "host",
+    hostAddress: getLocalIPv4(),
     hostPort: 9999,
     localIPv4: getLocalIPv4(),
   };
@@ -116,11 +99,7 @@ function loadConfig() {
   const existing = readJson(CONFIG_FILE, {});
   const existingPort = Number(existing.hostPort);
   const normalizedHostPort =
-    Number.isFinite(existingPort) && existingPort > 0
-      ? existingPort === 9810
-        ? defaults.hostPort
-        : existingPort
-      : defaults.hostPort;
+    Number.isFinite(existingPort) && existingPort > 0 ? existingPort : defaults.hostPort;
 
   const merged = {
     ...defaults,
@@ -148,7 +127,6 @@ module.exports = {
   APP_ROOT,
   STORAGE_ROOT,
   DATA_ROOT,
-  DOWNLOAD_ROOT,
   CONFIG_FILE,
   META_FILE,
   CLIENT_PROFILE_FILE,
@@ -160,3 +138,9 @@ module.exports = {
   writeJson,
   getLocalIPv4,
 };
+
+// 路径说明（相对关系，不硬编码）：
+// src/config.js (__dirname)
+//   ../          → BASE/          （源码根）
+//   ../../       → D:\PIP_KC\     （仓库根）
+//   ../../download → download/    （数据根 APP_ROOT）

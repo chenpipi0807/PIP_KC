@@ -1,0 +1,15 @@
+{
+  "name": "pip-kuaichuan",
+  "version": "1.0.0",
+  "description": "PIP_快传 LAN file sharing web service",
+  "main": "web-server.js",
+  "scripts": {
+    "start": "node web-server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "busboy": "^1.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  }
+}
