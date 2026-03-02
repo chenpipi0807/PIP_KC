@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PIP_快传</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-bg"></div>
+    <div class="layout">
+      <aside class="panel sidebar">
+        <div class="brand">
+          <h1>PIP_快传</h1>
+          <p>局域网高速文件共享盘</p>
+        </div>
+
+        <section class="card">
+          <h2>设备身份</h2>
+          <div class="meta-row"><span>设备ID</span><code id="deviceId">-</code></div>
+          <label class="field">
+            <span>用户ID（建议首次修改）</span>
+            <input id="userIdInput" type="text" maxlength="32" placeholder="输入你的名字" />
+          </label>
+        </section>
+
+        <section class="card">
+          <h2>网络角色</h2>
+          <label class="field">
+            <span>角色</span>
+            <select id="roleSelect">
+              <option value="client">子服务器（连接母服务器）</option>
+              <option value="host">母服务器（本机共享）</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>母服务器 IPv4</span>
+            <input id="hostAddressInput" type="text" placeholder="例如 10.250.9.82" />
+          </label>
+          <label class="field">
+            <span>端口</span>
+            <input id="hostPortInput" type="number" min="1" max="65535" />
+          </label>
+          <button id="saveConfigBtn" class="btn btn-primary">保存配置</button>
+        </section>
+
+        <section class="card compact">
+          <div class="meta-row"><span>母服务器IP</span><strong id="hostIp">-</strong></div>
+          <div class="meta-row"><span>当前访问IP</span><strong id="clientIp">-</strong></div>
+          <div class="meta-row"><span>本机 IPv4</span><strong id="localIPv4">-</strong></div>
+          <div class="meta-row"><span>服务状态</span><strong id="serverStatus">-</strong></div>
+          <div class="meta-row"><span>共享根目录</span><code id="storageRoot">-</code></div>
+          <div class="meta-row"><span>下载目录</span><code id="downloadRoot">-</code></div>
+        </section>
+      </aside>
+
+      <main class="panel content">
+        <header class="content-header">
+          <div>
+            <h2>共享目录</h2>
+            <p id="serverUrlLabel">-</p>
+          </div>
+          <div class="ops">
+            <div class="view-switch" role="group" aria-label="视图切换">
+              <button id="listViewBtn" class="btn view-btn is-active">列表</button>
+              <button id="gridViewBtn" class="btn view-btn">缩略图</button>
+            </div>
+            <button id="selectAllBtn" class="btn">全选</button>
+            <button id="clearSelectionBtn" class="btn">清空选择</button>
+            <button id="downloadSelectedBtn" class="btn">下载选中(0)</button>
+            <button id="refreshBtn" class="btn">刷新</button>
+            <button id="toggleLogBtn" class="btn">查看日志</button>
+            <button id="upBtn" class="btn">上一级</button>
+            <button id="newFolderBtn" class="btn">新建文件夹</button>
+            <button id="uploadBtn" class="btn btn-primary">上传文件</button>
+            <button id="uploadFolderBtn" class="btn">上传文件夹</button>
+          </div>
+        </header>
+
+        <nav id="breadcrumb" class="breadcrumb"></nav>
+
+        <section id="dropUploadZone" class="drop-upload-zone">
+          拖拽文件或整个文件夹到这里上传
+        </section>
+
+        <section id="uploadPanel" class="upload-panel hidden">
+          <div class="upload-meta">
+            <span id="uploadStatusText">准备上传...</span>
+            <span id="uploadSpeedText">0 B/s</span>
+          </div>
+          <div class="upload-track">
+            <div id="uploadProgressBar" class="upload-bar"></div>
+          </div>
+        </section>
+
+        <section id="logPanel" class="log-panel hidden">
+          <div class="log-toolbar">
+            <strong>操作日志（log.txt）</strong>
+            <div class="log-toolbar-actions">
+              <button id="refreshLogBtn" class="btn">刷新日志</button>
+              <button id="closeLogBtn" class="btn">收起</button>
+            </div>
+          </div>
+          <div id="logMeta" class="log-meta">-</div>
+          <pre id="logText" class="log-text">暂无日志</pre>
+        </section>
+
+        <section id="tableWrap" class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>类型</th>
+                <th>大小</th>
+                <th>上传者</th>
+                <th>上传时间</th>
+                <th>存储状态</th>
+                <th>更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="fileTableBody"></tbody>
+          </table>
+        </section>
+        <section id="fileGrid" class="file-grid hidden"></section>
+
+        <p id="emptyState" class="empty">当前目录为空，可上传任意类型文件。</p>
+      </main>
+    </div>
+
+    <input id="fileInput" type="file" multiple hidden />
+    <input id="folderInput" type="file" webkitdirectory directory multiple hidden />
+
+    <div id="toast" class="toast"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>
