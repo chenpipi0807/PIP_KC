@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PIP_kuaichuan</title>
+    <title>PIP_快传</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -12,7 +12,7 @@
     <div class="layout">
       <aside class="panel sidebar">
         <div class="brand">
-          <h1>PIP_kuaichuan</h1>
+          <h1>PIP_快传</h1>
           <p>局域网高速文件共享盘</p>
         </div>
 
@@ -123,6 +123,90 @@
     <input id="folderInput" type="file" webkitdirectory directory multiple hidden />
 
     <div id="toast" class="toast"></div>
+
+    <!-- ── 文件预览全屏弹窗 ── -->
+    <div id="previewOverlay" class="preview-overlay hidden" role="dialog" aria-modal="true" aria-label="文件预览">
+      <div class="preview-toolbar">
+        <span id="previewTitle" class="preview-title"></span>
+        <div class="preview-toolbar-actions">
+          <a id="previewDownloadBtn" class="btn btn-primary" href="#" download>下载</a>
+          <button id="previewCloseBtn" class="btn preview-close-btn" title="关闭 (ESC)">✕</button>
+        </div>
+      </div>
+      <div id="previewBody" class="preview-body">
+        <!-- 左翻页按钮 -->
+        <button id="previewPrevBtn" class="preview-nav-btn preview-nav-prev" title="上一个 (←)" aria-label="上一个文件">&#8249;</button>
+        <!-- 图片 -->
+        <img id="previewImage" class="preview-image hidden" alt="预览图片" />
+        <!-- 视频 -->
+        <video id="previewVideo" class="preview-video hidden" controls playsinline></video>
+        <!-- 文本/Markdown/代码 -->
+        <div id="previewTextWrap" class="preview-text-wrap hidden">
+          <pre id="previewText" class="preview-text"></pre>
+        </div>
+        <!-- Markdown 渲染 -->
+        <div id="previewMarkdown" class="preview-markdown hidden"></div>
+        <!-- PDF -->
+        <iframe id="previewPdf" class="preview-pdf hidden" title="PDF预览"></iframe>
+        <!-- 不支持 -->
+        <div id="previewUnsupported" class="preview-unsupported hidden">
+          <div class="preview-unsupported-icon">🚫</div>
+          <p id="previewUnsupportedMsg">该文件格式不支持预览</p>
+          <a id="previewUnsupportedDownload" class="btn btn-primary" href="#" download>下载文件</a>
+        </div>
+        <!-- 加载中 -->
+        <div id="previewLoading" class="preview-loading">
+          <div class="preview-spinner"></div>
+          <p>加载中…</p>
+        </div>
+        <!-- 右翻页按钮 -->
+        <button id="previewNextBtn" class="preview-nav-btn preview-nav-next" title="下一个 (→)" aria-label="下一个文件">&#8250;</button>
+      </div>
+    </div>
+
+    <!-- ── 密码验证弹窗（非管理员访问加密文件夹） ── -->
+    <div id="lockOverlay" class="lock-overlay hidden" role="dialog" aria-modal="true" aria-label="密码验证">
+      <div class="lock-dialog">
+        <div class="lock-icon">🔒</div>
+        <h3 class="lock-title">该文件夹已加密</h3>
+        <p id="lockFolderName" class="lock-folder-name"></p>
+        <label class="lock-label">
+          <span>请输入访问密码</span>
+          <input id="lockPasswordInput" type="password" class="lock-input" placeholder="输入密码…" autocomplete="current-password" />
+        </label>
+        <p id="lockError" class="lock-error hidden">密码错误，请重试</p>
+        <div class="lock-actions">
+          <button id="lockConfirmBtn" class="btn btn-primary">确认</button>
+          <button id="lockCancelBtn" class="btn">返回上级</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 管理员：文件夹加密设置弹窗 ── -->
+    <div id="adminLockOverlay" class="lock-overlay hidden" role="dialog" aria-modal="true" aria-label="设置文件夹密码">
+      <div class="lock-dialog">
+        <div class="lock-icon" id="adminLockIcon">🔐</div>
+        <h3 class="lock-title" id="adminLockTitle">设置文件夹密码</h3>
+        <p id="adminLockFolderName" class="lock-folder-name"></p>
+        <div id="adminLockSetForm">
+          <label class="lock-label">
+            <span>新密码</span>
+            <input id="adminLockPasswordInput" type="password" class="lock-input" placeholder="输入密码（不少于4位）…" autocomplete="new-password" />
+          </label>
+          <label class="lock-label">
+            <span>确认密码</span>
+            <input id="adminLockPasswordConfirm" type="password" class="lock-input" placeholder="再次输入密码…" autocomplete="new-password" />
+          </label>
+        </div>
+        <p id="adminLockError" class="lock-error hidden"></p>
+        <div class="lock-actions">
+          <button id="adminLockConfirmBtn" class="btn btn-primary">设置密码</button>
+          <button id="adminLockRemoveBtn" class="btn btn-danger hidden">解除加密</button>
+          <button id="adminLockCancelBtn" class="btn">取消</button>
+        </div>
+      </div>
+    </div>
+
     <script src="./app.js"></script>
   </body>
 </html>

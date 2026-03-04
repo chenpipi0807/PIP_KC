@@ -15,6 +15,10 @@ const state = {
   selectedPaths: new Set(),
   logPanelOpen: false,
   refreshTimer: null,
+  // 本 session 已验证密码的文件夹路径集合（key=folderPath, value=true）
+  unlockedFolders: new Set(),
+  // 本 session 已验证文件夹的访问 token（Map<folderPath, accessToken>），随请求发送给后端
+  folderTokens: new Map(),
 };
 
 const DEFAULT_UPLOAD_CONCURRENCY = 8;
@@ -63,6 +67,42 @@ const els = {
   logText: document.getElementById("logText"),
   serverLogText: document.getElementById("serverLogText"),
   toast: document.getElementById("toast"),
+  // 预览弹窗
+  previewOverlay: document.getElementById("previewOverlay"),
+  previewTitle: document.getElementById("previewTitle"),
+  previewDownloadBtn: document.getElementById("previewDownloadBtn"),
+  previewCloseBtn: document.getElementById("previewCloseBtn"),
+  previewBody: document.getElementById("previewBody"),
+  previewPrevBtn: document.getElementById("previewPrevBtn"),
+  previewNextBtn: document.getElementById("previewNextBtn"),
+  previewImage: document.getElementById("previewImage"),
+  previewVideo: document.getElementById("previewVideo"),
+  previewTextWrap: document.getElementById("previewTextWrap"),
+  previewText: document.getElementById("previewText"),
+  previewMarkdown: document.getElementById("previewMarkdown"),
+  previewPdf: document.getElementById("previewPdf"),
+  previewUnsupported: document.getElementById("previewUnsupported"),
+  previewUnsupportedMsg: document.getElementById("previewUnsupportedMsg"),
+  previewUnsupportedDownload: document.getElementById("previewUnsupportedDownload"),
+  previewLoading: document.getElementById("previewLoading"),
+  // 访客密码验证弹窗
+  lockOverlay: document.getElementById("lockOverlay"),
+  lockFolderName: document.getElementById("lockFolderName"),
+  lockPasswordInput: document.getElementById("lockPasswordInput"),
+  lockError: document.getElementById("lockError"),
+  lockConfirmBtn: document.getElementById("lockConfirmBtn"),
+  lockCancelBtn: document.getElementById("lockCancelBtn"),
+  // 管理员加密设置弹窗
+  adminLockOverlay: document.getElementById("adminLockOverlay"),
+  adminLockIcon: document.getElementById("adminLockIcon"),
+  adminLockTitle: document.getElementById("adminLockTitle"),
+  adminLockFolderName: document.getElementById("adminLockFolderName"),
+  adminLockPasswordInput: document.getElementById("adminLockPasswordInput"),
+  adminLockPasswordConfirm: document.getElementById("adminLockPasswordConfirm"),
+  adminLockError: document.getElementById("adminLockError"),
+  adminLockConfirmBtn: document.getElementById("adminLockConfirmBtn"),
+  adminLockRemoveBtn: document.getElementById("adminLockRemoveBtn"),
+  adminLockCancelBtn: document.getElementById("adminLockCancelBtn"),
 };
 
 function baseUrl() {
@@ -346,6 +386,394 @@ function storageBadge(type) {
   return "-";
 }
 
+// ══════════════════════════════════════════════════════
+// ── 文件预览系统 ──────────────────────────────────────
+// ══════════════════════════════════════════════════════
+
+const PREVIEW_IMAGE_EXTS = new Set(["png","jpg","jpeg","gif","webp","svg","bmp","ico","avif","tiff","tif"]);
+const PREVIEW_VIDEO_EXTS = new Set(["mp4","webm","ogg","mov","avi","mkv","flv","m4v","3gp"]);
+const PREVIEW_TEXT_EXTS  = new Set(["txt","log","csv","json","xml","yaml","yml","toml","ini","conf","cfg",
+  "sh","bat","js","ts","py","java","c","cpp","h","css","html","htm","sql","rs","go","rb","php","swift","kt"]);
+const PREVIEW_MD_EXTS    = new Set(["md","markdown"]);
+const PREVIEW_PDF_EXTS   = new Set(["pdf"]);
+
+function getPreviewType(ext) {
+  const e = (ext || "").toLowerCase();
+  if (PREVIEW_IMAGE_EXTS.has(e)) return "image";
+  if (PREVIEW_VIDEO_EXTS.has(e)) return "video";
+  if (PREVIEW_MD_EXTS.has(e))    return "markdown";
+  if (PREVIEW_TEXT_EXTS.has(e))  return "text";
+  if (PREVIEW_PDF_EXTS.has(e))   return "pdf";
+  return "unsupported";
+}
+
+/** 简易 Markdown → HTML 渲染（无外部依赖） */
+function renderMarkdown(text) {
+  // 先转义 HTML，再做 md 转换
+  const escaped = text
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  return escaped
+    // 标题 h1-h6
+    .replace(/^######\s+(.+)$/gm, "<h6>$1</h6>")
+    .replace(/^#####\s+(.+)$/gm,  "<h5>$1</h5>")
+    .replace(/^####\s+(.+)$/gm,   "<h4>$1</h4>")
+    .replace(/^###\s+(.+)$/gm,    "<h3>$1</h3>")
+    .replace(/^##\s+(.+)$/gm,     "<h2>$1</h2>")
+    .replace(/^#\s+(.+)$/gm,      "<h1>$1</h1>")
+    // 代码块 ```
+    .replace(/```[\w]*\n?([\s\S]*?)```/g, "<pre><code>$1</code></pre>")
+    // 行内代码
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    // 粗斜体
+    .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
+    // 粗体
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    // 斜体
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    // 删除线
+    .replace(/~~(.+?)~~/g, "<del>$1</del>")
+    // 链接 [text](url)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    // 无序列表
+    .replace(/^[-*+]\s+(.+)$/gm, "<li>$1</li>")
+    .replace(/(<li>.*<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`)
+    // 有序列表
+    .replace(/^\d+\.\s+(.+)$/gm, "<li>$1</li>")
+    // 水平线
+    .replace(/^---+$/gm, "<hr/>")
+    // 换行
+    .replace(/\n\n/g, "</p><p>")
+    .replace(/\n/g, "<br/>");
+}
+
+function hideAllPreviewPanels() {
+  els.previewImage.classList.add("hidden");
+  els.previewVideo.classList.add("hidden");
+  els.previewTextWrap.classList.add("hidden");
+  els.previewMarkdown.classList.add("hidden");
+  els.previewPdf.classList.add("hidden");
+  els.previewUnsupported.classList.add("hidden");
+  els.previewLoading.classList.add("hidden");
+  // 停止视频播放
+  els.previewVideo.pause();
+  els.previewVideo.src = "";
+  // 清理 pdf iframe
+  els.previewPdf.src = "";
+}
+
+// 当前预览的文件在 state.files 中的索引（-1 表示未打开）
+let previewCurrentIndex = -1;
+
+function closePreview() {
+  hideAllPreviewPanels();
+  els.previewOverlay.classList.add("hidden");
+  // 防止视频/音频继续播放
+  els.previewVideo.pause();
+  els.previewVideo.src = "";
+  document.body.style.overflow = "";
+  previewCurrentIndex = -1;
+}
+
+/** 获取已解锁文件夹 token 的 query 参数字符串（含前缀 & 或为空） */
+function getFolderTokensParam() {
+  const tokenValues = Array.from(state.folderTokens.values());
+  return tokenValues.length
+    ? `&folder_tokens=${encodeURIComponent(tokenValues.join(","))}`
+    : "";
+}
+
+/** 在当前预览列表中切换到下一个（delta=+1）或上一个（delta=-1）文件 */
+function previewNavigate(delta) {
+  const previewableFiles = state.files.filter(f => f.type === "file");
+  if (!previewableFiles.length) return;
+  // 在所有文件中找索引
+  const allFiles = state.files;
+  let idx = previewCurrentIndex;
+  // 找下一个方向的文件
+  let newIdx = idx + delta;
+  while (newIdx >= 0 && newIdx < allFiles.length) {
+    if (allFiles[newIdx].type === "file") {
+      openPreview(allFiles[newIdx]);
+      return;
+    }
+    newIdx += delta;
+  }
+}
+
+async function openPreview(item) {
+  if (!item || item.type === "folder") return;
+
+  // 记录当前 item 在 state.files 中的索引（用于左右翻页）
+  const idxInFiles = state.files.indexOf(item);
+  previewCurrentIndex = idxInFiles >= 0 ? idxInFiles : -1;
+
+  // 更新翻页按钮可见性
+  if (els.previewPrevBtn && els.previewNextBtn) {
+    const allFiles = state.files;
+    // 向前找有没有文件
+    let hasPrev = false;
+    for (let i = previewCurrentIndex - 1; i >= 0; i--) {
+      if (allFiles[i].type === "file") { hasPrev = true; break; }
+    }
+    let hasNext = false;
+    for (let i = previewCurrentIndex + 1; i < allFiles.length; i++) {
+      if (allFiles[i].type === "file") { hasNext = true; break; }
+    }
+    els.previewPrevBtn.style.visibility = hasPrev ? "visible" : "hidden";
+    els.previewNextBtn.style.visibility = hasNext ? "visible" : "hidden";
+  }
+
+  const ext = getFileExt(item.name);
+  const previewType = getPreviewType(ext);
+
+  // 携带已解锁的文件夹 token（img/video/iframe 无法加请求头，用 query 参数）
+  const tokenParam = getFolderTokensParam();
+
+  const previewUrl = `${baseUrl()}/api/preview?path=${encodeURIComponent(item.path)}${tokenParam}`;
+  const downloadUrl = `${baseUrl()}/api/download?path=${encodeURIComponent(item.path)}${tokenParam}`;
+
+  // 打开弹窗
+  els.previewOverlay.classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  els.previewTitle.textContent = item.name;
+  els.previewDownloadBtn.href = downloadUrl;
+  els.previewDownloadBtn.download = item.name;
+
+  hideAllPreviewPanels();
+  els.previewLoading.classList.remove("hidden");
+
+  try {
+    if (previewType === "image") {
+      const img = els.previewImage;
+      img.src = "";
+      img.onload = () => {
+        els.previewLoading.classList.add("hidden");
+        img.classList.remove("hidden");
+      };
+      img.onerror = () => {
+        els.previewLoading.classList.add("hidden");
+        els.previewUnsupportedMsg.textContent = "图片加载失败";
+        els.previewUnsupported.classList.remove("hidden");
+        els.previewUnsupportedDownload.href = downloadUrl;
+        els.previewUnsupportedDownload.download = item.name;
+      };
+      img.src = previewUrl;
+      return;
+    }
+
+    if (previewType === "video") {
+      const video = els.previewVideo;
+      video.src = previewUrl;
+      video.load();
+      els.previewLoading.classList.add("hidden");
+      video.classList.remove("hidden");
+      return;
+    }
+
+    if (previewType === "pdf") {
+      els.previewPdf.src = previewUrl;
+      els.previewLoading.classList.add("hidden");
+      els.previewPdf.classList.remove("hidden");
+      return;
+    }
+
+    if (previewType === "text" || previewType === "markdown") {
+      const response = await fetch(previewUrl);
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.message || `加载失败：${response.status}`);
+      }
+      const text = await response.text();
+      els.previewLoading.classList.add("hidden");
+
+      if (previewType === "markdown") {
+        els.previewMarkdown.innerHTML = `<div class="md-body">${renderMarkdown(text)}</div>`;
+        els.previewMarkdown.classList.remove("hidden");
+      } else {
+        els.previewText.textContent = text;
+        els.previewTextWrap.classList.remove("hidden");
+      }
+      return;
+    }
+
+    // 不支持
+    els.previewLoading.classList.add("hidden");
+    els.previewUnsupportedMsg.textContent = `不支持预览 .${ext || "未知"} 格式的文件`;
+    els.previewUnsupportedDownload.href = downloadUrl;
+    els.previewUnsupportedDownload.download = item.name;
+    els.previewUnsupported.classList.remove("hidden");
+
+  } catch (error) {
+    els.previewLoading.classList.add("hidden");
+    if (error && error.message && error.message.includes("不支持")) {
+      els.previewUnsupportedMsg.textContent = error.message;
+    } else {
+      els.previewUnsupportedMsg.textContent = `预览失败：${error.message}`;
+    }
+    els.previewUnsupportedDownload.href = downloadUrl;
+    els.previewUnsupportedDownload.download = item.name;
+    els.previewUnsupported.classList.remove("hidden");
+  }
+}
+
+// ══════════════════════════════════════════════════════
+// ── 文件夹密码验证（访客） ────────────────────────────
+// ══════════════════════════════════════════════════════
+
+let lockResolve = null;      // Promise resolve 回调
+let currentLockPath = "";    // 当前正在验证的文件夹路径
+
+function showLockDialog(folderPath, folderName) {
+  return new Promise((resolve) => {
+    lockResolve = resolve;
+    currentLockPath = folderPath;
+    els.lockFolderName.textContent = `文件夹：${folderName || folderPath}`;
+    els.lockPasswordInput.value = "";
+    els.lockError.classList.add("hidden");
+    els.lockOverlay.classList.remove("hidden");
+    els.lockPasswordInput.focus();
+  });
+}
+
+function hideLockDialog() {
+  els.lockOverlay.classList.add("hidden");
+  els.lockPasswordInput.value = "";
+  els.lockError.classList.add("hidden");
+  if (lockResolve) {
+    lockResolve(false);
+    lockResolve = null;
+  }
+}
+
+async function submitLockPassword(folderPath) {
+  const password = els.lockPasswordInput.value.trim();
+  if (!password) {
+    els.lockError.textContent = "请输入密码";
+    els.lockError.classList.remove("hidden");
+    return;
+  }
+  try {
+    const result = await requestJson(`${baseUrl()}/api/folder-lock/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: folderPath, password }),
+    });
+    if (result.verified) {
+      state.unlockedFolders.add(folderPath);
+      // 存储后端颁发的 accessToken，后续请求 /api/files 时携带
+      if (result.accessToken) {
+        state.folderTokens.set(folderPath, result.accessToken);
+      }
+      els.lockOverlay.classList.add("hidden");
+      els.lockPasswordInput.value = "";
+      if (lockResolve) { lockResolve(true); lockResolve = null; }
+    } else {
+      els.lockError.textContent = "密码错误，请重试";
+      els.lockError.classList.remove("hidden");
+      els.lockPasswordInput.select();
+    }
+  } catch (error) {
+    els.lockError.textContent = `验证失败：${error.message}`;
+    els.lockError.classList.remove("hidden");
+  }
+}
+
+// ══════════════════════════════════════════════════════
+// ── 管理员：文件夹加密设置 ────────────────────────────
+// ══════════════════════════════════════════════════════
+
+let adminLockCurrentPath = "";
+let adminLockCurrentName = "";
+let adminLockIsCurrentlyLocked = false;
+
+async function openAdminLockDialog(folderPath, folderName, isLocked) {
+  adminLockCurrentPath = folderPath;
+  adminLockCurrentName = folderName;
+  adminLockIsCurrentlyLocked = isLocked;
+
+  els.adminLockFolderName.textContent = `文件夹：${folderName || folderPath}`;
+  els.adminLockPasswordInput.value = "";
+  els.adminLockPasswordConfirm.value = "";
+  els.adminLockError.classList.add("hidden");
+  els.adminLockError.textContent = "";
+
+  if (isLocked) {
+    els.adminLockIcon.textContent = "🔒";
+    els.adminLockTitle.textContent = "修改文件夹密码";
+    els.adminLockRemoveBtn.classList.remove("hidden");
+    els.adminLockConfirmBtn.textContent = "更新密码";
+  } else {
+    els.adminLockIcon.textContent = "🔓";
+    els.adminLockTitle.textContent = "设置文件夹密码";
+    els.adminLockRemoveBtn.classList.add("hidden");
+    els.adminLockConfirmBtn.textContent = "设置密码";
+  }
+
+  els.adminLockOverlay.classList.remove("hidden");
+  els.adminLockPasswordInput.focus();
+}
+
+function hideAdminLockDialog() {
+  els.adminLockOverlay.classList.add("hidden");
+  els.adminLockPasswordInput.value = "";
+  els.adminLockPasswordConfirm.value = "";
+  els.adminLockError.classList.add("hidden");
+}
+
+async function submitAdminLockPassword() {
+  const password = els.adminLockPasswordInput.value.trim();
+  const confirm = els.adminLockPasswordConfirm.value.trim();
+
+  if (!password) {
+    els.adminLockError.textContent = "密码不能为空";
+    els.adminLockError.classList.remove("hidden");
+    return;
+  }
+  if (password.length < 4) {
+    els.adminLockError.textContent = "密码至少需要 4 位";
+    els.adminLockError.classList.remove("hidden");
+    return;
+  }
+  if (password !== confirm) {
+    els.adminLockError.textContent = "两次密码输入不一致";
+    els.adminLockError.classList.remove("hidden");
+    return;
+  }
+
+  try {
+    await requestJson(`${baseUrl()}/api/folder-lock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: adminLockCurrentPath, password }),
+    });
+    hideAdminLockDialog();
+    await refreshFiles();
+    showToast(`文件夹「${adminLockCurrentName}」已设置密码`, "success");
+  } catch (error) {
+    els.adminLockError.textContent = `设置失败：${error.message}`;
+    els.adminLockError.classList.remove("hidden");
+  }
+}
+
+async function removeAdminLock() {
+  const ok = window.confirm(`确认移除文件夹「${adminLockCurrentName}」的访问密码吗？`);
+  if (!ok) return;
+
+  try {
+    await requestJson(`${baseUrl()}/api/folder-lock?path=${encodeURIComponent(adminLockCurrentPath)}`, {
+      method: "DELETE",
+    });
+    hideAdminLockDialog();
+    state.unlockedFolders.delete(adminLockCurrentPath);
+    await refreshFiles();
+    showToast(`文件夹「${adminLockCurrentName}」已解除加密`, "success");
+  } catch (error) {
+    els.adminLockError.textContent = `解除失败：${error.message}`;
+    els.adminLockError.classList.remove("hidden");
+  }
+}
+
 function renderConfig() {
   const cfg = state.config;
   els.deviceId.textContent = cfg.deviceId;
@@ -551,17 +979,24 @@ function handleEntryActionClick(eventTarget) {
     return true;
   }
 
+  // 文件名点击 → 预览
+  const previewTarget = eventTarget.closest("[data-preview]");
+  if (previewTarget) {
+    const previewPath = decodeDataValue(previewTarget.dataset.preview);
+    const item = state.files.find((f) => f.path === previewPath);
+    if (item) openPreview(item);
+    return true;
+  }
+
   const openTarget = eventTarget.closest("[data-open]");
   if (openTarget) {
-    state.currentPath = decodeDataValue(openTarget.dataset.open);
-    refreshFiles();
+    enterFolder(decodeDataValue(openTarget.dataset.open));
     return true;
   }
 
   const enterTarget = eventTarget.closest("[data-enter]");
   if (enterTarget) {
-    state.currentPath = decodeDataValue(enterTarget.dataset.enter);
-    refreshFiles();
+    enterFolder(decodeDataValue(enterTarget.dataset.enter));
     return true;
   }
 
@@ -598,12 +1033,61 @@ function handleEntryActionClick(eventTarget) {
   if (permanentTarget) {
     upgradePermanent(
       decodeDataValue(permanentTarget.dataset.permanent),
-      decodeDataValue(permanentTarget.dataset.name)
+      decodeDataValue(permanentTarget.dataset.name),
+      permanentTarget.dataset.entryType || "file"
     );
     return true;
   }
 
+  const lockTarget = eventTarget.closest("[data-lock-folder]");
+  if (lockTarget) {
+    const lockPath = decodeDataValue(lockTarget.dataset.lockFolder);
+    const lockName = decodeDataValue(lockTarget.dataset.name);
+    const isLocked = lockTarget.dataset.isLocked === "true";
+    openAdminLockDialog(lockPath, lockName, isLocked);
+    return true;
+  }
+
   return false;
+}
+
+// ── 进入文件夹（带加密检查） ─────────────────────────────────────────────────
+async function enterFolder(folderPath) {
+  if (state.isAdmin) {
+    state.currentPath = folderPath;
+    refreshFiles();
+    return;
+  }
+
+  // 找到顶级路径（只有顶级文件夹才可能被锁定）
+  const topLevel = folderPath.split("/")[0];
+
+  // 已在本 session 解锁
+  if (state.unlockedFolders.has(topLevel)) {
+    state.currentPath = folderPath;
+    refreshFiles();
+    return;
+  }
+
+  // 查询服务端是否被锁
+  try {
+    const result = await requestJson(`${baseUrl()}/api/folder-lock?path=${encodeURIComponent(topLevel)}`);
+    if (!result.isLocked) {
+      state.currentPath = folderPath;
+      refreshFiles();
+      return;
+    }
+    // 需要密码
+    const folderItem = state.files.find((f) => f.path === topLevel);
+    const folderName = folderItem ? folderItem.name : topLevel;
+    const verified = await showLockDialog(topLevel, folderName);
+    if (verified) {
+      state.currentPath = folderPath;
+      refreshFiles();
+    }
+  } catch (error) {
+    showToast(`进入文件夹失败：${error.message}`, "error");
+  }
 }
 
 function renderListRows() {
@@ -617,29 +1101,49 @@ function renderListRows() {
       const iconLabel = iconLabelForEntry(item);
       const rowClasses = ["file-row"];
       const isFile = item.type === "file";
+      const isFolder = item.type === "folder";
       const checked = isFile && isSelectedPath(item.path) ? "checked" : "";
       const selectDisabledAttr = isFile ? "" : "disabled";
       if (checked) rowClasses.push("is-selected");
-      if (item.type === "folder") rowClasses.push("drop-target-folder");
+      if (isFolder) rowClasses.push("drop-target-folder");
 
-      const openAction =
-        item.type === "folder"
-          ? `<button class="entry-name folder" data-open="${encodedPath}">${safeName}</button>`
-          : `<span class="entry-name">${safeName}</span>`;
+      // 是否是根目录下的直接子文件夹（可加密/可永久）
+      const isTopLevelFolder = isFolder && !item.path.includes("/");
+      const lockIcon = item.isLocked ? ' <span class="lock-badge" title="已加密">🔒</span>' : "";
+      const permanentBadge = isFolder && item.storageType === "permanent"
+        ? ' <span class="tag tag-permanent" title="永久存储">永久</span>' : "";
+
+      // 文件名：文件点击触发预览，文件夹点击进入
+      const openAction = isFolder
+        ? `<button class="entry-name folder" data-open="${encodedPath}">${safeName}${lockIcon}${permanentBadge}</button>`
+        : `<button class="entry-name entry-name-file" data-preview="${encodedPath}" title="点击预览">${safeName}</button>`;
 
       const actions = [];
-      if (item.type === "folder") {
+      if (isFolder) {
         actions.push(`<button class="btn" data-enter="${encodedPath}">进入</button>`);
         actions.push(
           `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="folder" data-filename="${encodedName}">下载zip</button>`
         );
+        // 管理员：文件夹加密（仅顶级）
+        if (state.isAdmin && isTopLevelFolder) {
+          const isLocked = Boolean(item.isLocked);
+          actions.push(
+            `<button class="btn ${isLocked ? "btn-lock-active" : ""}" data-lock-folder="${encodedPath}" data-name="${encodedName}" data-is-locked="${isLocked}">${isLocked ? "🔒改密" : "🔓加密"}</button>`
+          );
+        }
+        // 管理员：文件夹升级永久
+        if (state.isAdmin && item.storageType !== "permanent") {
+          actions.push(
+            `<button class="btn" data-permanent="${encodedPath}" data-name="${encodedName}" data-entry-type="folder">升级永久</button>`
+          );
+        }
       } else {
         actions.push(
           `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="file" data-filename="${encodedName}">下载</button>`
         );
         if (state.isAdmin && item.storageType === "temporary") {
           actions.push(
-            `<button class="btn" data-permanent="${encodedPath}" data-name="${encodedName}">升级永久</button>`
+            `<button class="btn" data-permanent="${encodedPath}" data-name="${encodedName}" data-entry-type="file">升级永久</button>`
           );
         }
       }
@@ -653,31 +1157,37 @@ function renderListRows() {
 
       const opHtml = actions.join(" ");
       const dropAttrs =
-        item.type === "folder" ? ` data-drop-folder="${encodedPath}" title="可拖拽文件/文件夹到此"` : "";
-      const folderOpenAttr = item.type === "folder" ? ` data-folder-open="${encodedPath}"` : "";
+        isFolder ? ` data-drop-folder="${encodedPath}" title="可拖拽文件/文件夹到此"` : "";
+      const folderOpenAttr = isFolder ? ` data-folder-open="${encodedPath}"` : "";
+
+      // 图片文件缩略图（列表视图显示小正方形缩略图）
+      const isImageFile = isFile && PREVIEW_IMAGE_EXTS.has(getFileExt(item.name));
+      const listThumbHtml = isImageFile
+        ? `<img class="entry-thumb" src="${baseUrl()}/api/preview?path=${encodeURIComponent(item.path)}${getFolderTokensParam()}" alt="" loading="lazy" />`
+        : `<span class="entry-icon ${iconClass}">${iconLabel}</span>`;
 
       return `
       <tr class="${rowClasses.join(" ")}" draggable="true" data-drag-path="${encodedPath}" data-drag-type="${item.type}"${dropAttrs}${folderOpenAttr}>
         <td>
           <div class="entry-main">
             <input class="entry-check" type="checkbox" data-select-path="${encodedPath}" ${checked} ${selectDisabledAttr} />
-            <span class="entry-icon ${iconClass}">${iconLabel}</span>
+            ${listThumbHtml}
             <div class="entry-name-wrap">
               ${openAction}
-              ${item.type === "folder" ? '<div class="entry-sub">拖到这里可移动</div>' : ""}
+              ${isFolder ? '<div class="entry-sub">拖到这里可移动</div>' : ""}
             </div>
           </div>
         </td>
         <td>${fileTypeTag(item.type)}</td>
-        <td>${item.type === "file" ? formatFileSize(item.size) : "-"}</td>
+        <td>${isFile ? formatFileSize(item.size) : "-"}</td>
         <td>
           <div>${safeUploader}</div>
           ${item.uploaderIP ? `<div class="uploader-ip">IP: ${escapeHtml(item.uploaderIP)}</div>` : ""}
         </td>
-        <td>${item.type === "file" ? formatTime(item.uploadedAt) : "-"}</td>
+        <td>${isFile ? formatTime(item.uploadedAt) : "-"}</td>
         <td>
-          ${item.type === "file" ? storageBadge(item.storageType) : "-"}
-          ${item.type === "file" && item.storageType === "temporary" && item.expiresAt ? `<div class="storage-expire">到期: ${formatTime(item.expiresAt)}</div>` : ""}
+          ${isFile ? storageBadge(item.storageType) : (item.storageType === "permanent" ? '<span class="tag tag-permanent">永久</span>' : "-")}
+          ${isFile && item.storageType === "temporary" && item.expiresAt ? `<div class="storage-expire">到期: ${formatTime(item.expiresAt)}</div>` : ""}
         </td>
         <td>${formatTime(item.modifiedAt)}</td>
         <td>${opHtml}</td>
@@ -694,26 +1204,39 @@ function renderGridCards() {
       const safeName = escapeHtml(item.name);
       const iconClass = iconClassForEntry(item);
       const iconLabel = iconLabelForEntry(item);
-      const canDrop = item.type === "folder";
+      const isFolder = item.type === "folder";
       const isFile = item.type === "file";
+      const isTopLevelFolder = isFolder && !item.path.includes("/");
       const checked = isFile && isSelectedPath(item.path) ? "checked" : "";
       const selectDisabledAttr = isFile ? "" : "disabled";
-      const dropAttrs = canDrop ? ` data-drop-folder="${encodedPath}"` : "";
-      const folderOpenAttr = canDrop ? ` data-folder-open="${encodedPath}"` : "";
+      const dropAttrs = isFolder ? ` data-drop-folder="${encodedPath}"` : "";
+      const folderOpenAttr = isFolder ? ` data-folder-open="${encodedPath}"` : "";
+      const lockIcon = item.isLocked ? ' 🔒' : "";
 
       const actions = [];
-      if (item.type === "folder") {
+      if (isFolder) {
         actions.push(`<button class="btn" data-enter="${encodedPath}">进入</button>`);
         actions.push(
-          `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="folder" data-filename="${encodedName}">下载zip</button>`
+          `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="folder" data-filename="${encodedName}">zip</button>`
         );
+        if (state.isAdmin && isTopLevelFolder) {
+          const isLocked = Boolean(item.isLocked);
+          actions.push(
+            `<button class="btn ${isLocked ? "btn-lock-active" : ""}" data-lock-folder="${encodedPath}" data-name="${encodedName}" data-is-locked="${isLocked}">${isLocked ? "🔒" : "🔓"}</button>`
+          );
+        }
+        if (state.isAdmin && item.storageType !== "permanent") {
+          actions.push(
+            `<button class="btn" data-permanent="${encodedPath}" data-name="${encodedName}" data-entry-type="folder">永久</button>`
+          );
+        }
       } else {
         actions.push(
           `<button class="btn btn-primary" data-download="${encodedPath}" data-entry-type="file" data-filename="${encodedName}">下载</button>`
         );
         if (state.isAdmin && item.storageType === "temporary") {
           actions.push(
-            `<button class="btn" data-permanent="${encodedPath}" data-name="${encodedName}">永久</button>`
+            `<button class="btn" data-permanent="${encodedPath}" data-name="${encodedName}" data-entry-type="file">永久</button>`
           );
         }
       }
@@ -722,19 +1245,32 @@ function renderGridCards() {
         `<button class="btn btn-danger" data-delete="${encodedPath}" data-type="${item.type}" data-name="${encodedName}">删</button>`
       );
 
+      // 文件名区域：文件夹点击进入，文件点击预览
+      const nameEl = isFolder
+        ? `<button class="file-card-name folder" data-open="${encodedPath}">${safeName}${lockIcon}</button>`
+        : `<button class="file-card-name entry-name-file" data-preview="${encodedPath}" title="点击预览">${safeName}</button>`;
+
+      // 网格视图：图片直接作为缩略图，文件名显示在缩略图下方（与普通文件一致）
+      const isGridImage = isFile && PREVIEW_IMAGE_EXTS.has(getFileExt(item.name));
+      const gridThumbEl = isGridImage
+        ? `<div class="file-card-thumb file-card-thumb-img" data-preview="${encodedPath}">
+             <img class="file-card-img-thumb" src="${baseUrl()}/api/preview?path=${encodeURIComponent(item.path)}${getFolderTokensParam()}" alt="${safeName}" loading="lazy" />
+           </div>`
+        : `<div class="file-card-thumb ${iconClass}">
+             <span class="file-card-icon">${iconLabel}</span>
+           </div>`;
+
       return `
-      <article class="file-card ${canDrop ? "drop-target-folder" : ""} ${checked ? "is-selected" : ""}" draggable="true" data-drag-path="${encodedPath}" data-drag-type="${item.type}"${dropAttrs}${folderOpenAttr}>
+      <article class="file-card ${isFolder ? "drop-target-folder" : ""} ${checked ? "is-selected" : ""}" draggable="true" data-drag-path="${encodedPath}" data-drag-type="${item.type}"${dropAttrs}${folderOpenAttr}>
         <label class="file-card-check-wrap">
           <input class="entry-check" type="checkbox" data-select-path="${encodedPath}" ${checked} ${selectDisabledAttr} />
         </label>
-        <div class="file-card-thumb ${iconClass}">
-          <span class="file-card-icon">${iconLabel}</span>
-        </div>
-        ${item.type === "folder" ? `<button class="file-card-name folder" data-open="${encodedPath}">${safeName}</button>` : `<span class="file-card-name">${safeName}</span>`}
-        <div class="file-card-meta">${item.type === "folder" ? "文件夹" : formatFileSize(item.size)}</div>
-        <div class="file-card-meta">${item.type === "file" ? (item.storageType === "permanent" ? "永久" : "临时") : "-"}</div>
+        ${gridThumbEl}
+        ${nameEl}
+        <div class="file-card-meta">${isFolder ? "文件夹" : formatFileSize(item.size)}</div>
+        <div class="file-card-meta">${isFile ? (item.storageType === "permanent" ? "永久" : "临时") : (item.storageType === "permanent" ? "永久" : "-")}</div>
         <div class="file-card-meta">${formatTime(item.modifiedAt)}</div>
-        ${canDrop ? '<div class="file-card-drop-tip">拖拽到这里可移动</div>' : ""}
+        ${isFolder ? '<div class="file-card-drop-tip">拖拽到这里可移动</div>' : ""}
         <div class="file-card-actions">${actions.join("")}</div>
       </article>`;
     })
@@ -764,11 +1300,18 @@ async function requestJson(url, options = {}) {
   return payload;
 }
 
+function getFolderTokensHeader() {
+  // 将所有已验证的 accessToken 拼接为逗号分隔字符串，发送给后端
+  const tokens = Array.from(state.folderTokens.values());
+  return tokens.length ? { "X-Folder-Tokens": tokens.join(",") } : {};
+}
+
 async function refreshFiles() {
   renderBreadcrumb();
   try {
     const payload = await requestJson(
-      `${baseUrl()}/api/files?path=${encodeURIComponent(state.currentPath)}`
+      `${baseUrl()}/api/files?path=${encodeURIComponent(state.currentPath)}`,
+      { headers: getFolderTokensHeader() }
     );
     state.currentPath = payload.path || "";
     state.files = payload.files || [];
@@ -822,23 +1365,29 @@ async function createFolder() {
   }
 }
 
-async function upgradePermanent(targetPath, itemName) {
+async function upgradePermanent(targetPath, itemName, entryType = "file") {
   if (!state.isAdmin) {
     showToast("仅管理员可升级为永久存储", "error");
     return;
   }
 
-  const ok = window.confirm(`确认将文件「${itemName}」升级为永久存储吗？`);
+  const label = entryType === "folder" ? "文件夹" : "文件";
+  const note = entryType === "folder" ? "（包含文件夹下所有子级文件）" : "";
+  const ok = window.confirm(`确认将${label}「${itemName}」升级为永久存储吗？${note}`);
   if (!ok) return;
 
   try {
-    await requestJson(`${baseUrl()}/api/files/permanent`, {
+    const result = await requestJson(`${baseUrl()}/api/files/permanent`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: targetPath }),
     });
     await refreshFiles();
-    showToast("已升级为永久存储", "success");
+    if (entryType === "folder") {
+      showToast(`文件夹已升级为永久存储（含 ${result.fileCount || 0} 个文件）`, "success");
+    } else {
+      showToast("已升级为永久存储", "success");
+    }
   } catch (error) {
     showToast(`升级失败：${error.message}`, "error");
   }
@@ -1042,10 +1591,13 @@ async function downloadFile(relativePath, fileName, entryType = "file") {
   // 文件夹下载时服务端返回 zip，确保保存文件名带 .zip 后缀
   const resolvedFileName = isFolder ? `${fileName || "folder"}.zip` : (fileName || "");
 
+  // 将已解锁的 token 拼成 query 参数（<a> 标签无法加自定义请求头）
+  const folderTokensParam = getFolderTokensParam();
+
   // 普通文件：直接用 <a> 标签下载
   if (!isFolder) {
     const link = document.createElement("a");
-    link.href = `${baseUrl()}/api/download?path=${encodeURIComponent(relativePath)}`;
+    link.href = `${baseUrl()}/api/download?path=${encodeURIComponent(relativePath)}${folderTokensParam}`;
     link.download = resolvedFileName;
     document.body.appendChild(link);
     link.click();
@@ -1061,7 +1613,7 @@ async function downloadFile(relativePath, fileName, entryType = "file") {
   try {
     const zipRes = await requestJson(`${baseUrl()}/api/zip`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...getFolderTokensHeader() },
       body: JSON.stringify({ path: relativePath }),
     });
     if (!zipRes.ok) {
@@ -1217,6 +1769,80 @@ function bindEvents() {
     }
   });
 
+  // ── 预览弹窗关闭 & 翻页
+  if (els.previewCloseBtn) {
+    els.previewCloseBtn.addEventListener("click", closePreview);
+  }
+  if (els.previewOverlay) {
+    // 点击背景（previewOverlay 层本身）关闭
+    els.previewOverlay.addEventListener("click", (e) => {
+      if (e.target === els.previewOverlay) closePreview();
+    });
+  }
+  // 点击 previewBody 空白处关闭（previewBody 本身被点中时）
+  if (els.previewBody) {
+    els.previewBody.addEventListener("click", (e) => {
+      if (e.target === els.previewBody) closePreview();
+    });
+  }
+  // 翻页按钮
+  if (els.previewPrevBtn) {
+    els.previewPrevBtn.addEventListener("click", () => previewNavigate(-1));
+  }
+  if (els.previewNextBtn) {
+    els.previewNextBtn.addEventListener("click", () => previewNavigate(1));
+  }
+
+  // ── 全局键盘：ESC 关闭弹窗，左右翻页
+  document.addEventListener("keydown", (e) => {
+    const previewOpen = els.previewOverlay && !els.previewOverlay.classList.contains("hidden");
+    if (e.key === "Escape") {
+      if (previewOpen) {
+        closePreview();
+      } else if (els.lockOverlay && !els.lockOverlay.classList.contains("hidden")) {
+        hideLockDialog();
+      } else if (els.adminLockOverlay && !els.adminLockOverlay.classList.contains("hidden")) {
+        hideAdminLockDialog();
+      }
+      return;
+    }
+    if (previewOpen) {
+      if (e.key === "ArrowLeft")  { e.preventDefault(); previewNavigate(-1); }
+      if (e.key === "ArrowRight") { e.preventDefault(); previewNavigate(1); }
+    }
+  });
+
+  // ── 访客文件夹密码弹窗
+  if (els.lockConfirmBtn) {
+    els.lockConfirmBtn.addEventListener("click", () => {
+      submitLockPassword(currentLockPath);
+    });
+  }
+  if (els.lockCancelBtn) {
+    els.lockCancelBtn.addEventListener("click", hideLockDialog);
+  }
+  if (els.lockPasswordInput) {
+    els.lockPasswordInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitLockPassword(currentLockPath);
+    });
+  }
+
+  // ── 管理员文件夹密码弹窗
+  if (els.adminLockConfirmBtn) {
+    els.adminLockConfirmBtn.addEventListener("click", submitAdminLockPassword);
+  }
+  if (els.adminLockRemoveBtn) {
+    els.adminLockRemoveBtn.addEventListener("click", removeAdminLock);
+  }
+  if (els.adminLockCancelBtn) {
+    els.adminLockCancelBtn.addEventListener("click", hideAdminLockDialog);
+  }
+  if (els.adminLockPasswordInput) {
+    els.adminLockPasswordInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitAdminLockPassword();
+    });
+  }
+
   const bindEntryContainer = (container) => {
     if (!container) return;
 
@@ -1229,8 +1855,7 @@ function bindEvents() {
       if (!folderNode) return;
       const folderPath = decodeDataValue(folderNode.dataset.folderOpen);
       if (!folderPath) return;
-      state.currentPath = folderPath;
-      refreshFiles();
+      enterFolder(folderPath);
     });
 
     container.addEventListener("dragstart", (event) => {

@@ -10,7 +10,7 @@ const Busboy = require("busboy");
 const cors = require("cors");
 const express = require("express");
 
-const { CLIENT_PROFILE_FILE, LOG_FILE, META_FILE, STORAGE_ROOT, readJson, writeJson } = require("./config");
+const { CLIENT_PROFILE_FILE, LOG_FILE, META_FILE, FOLDER_LOCK_FILE, STORAGE_ROOT, readJson, writeJson } = require("./config");
 
 const TEMP_FILE_TTL_MS = 24 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
@@ -274,7 +274,7 @@ async function cleanupExpiredTempFiles(metadata) {
   return changed;
 }
 
-async function listDirectory(relativePath = "", metadata = {}) {
+async function listDirectory(relativePath = "", metadata = {}, folderLocks = {}) {
   const { safeRelative, absolute } = resolveSafePath(relativePath);
 
   await fs.promises.mkdir(absolute, { recursive: true });
@@ -289,9 +289,10 @@ async function listDirectory(relativePath = "", metadata = {}) {
       const stat = await fs.promises.stat(entryAbsolute);
       const meta = metadata[entryRelative] || {};
       const uploadedAt = meta.uploadedAt || stat.mtime.toISOString();
-      const isPermanent = entry.isDirectory() ? false : Boolean(meta.isPermanent);
+      const isPermanent = entry.isDirectory() ? Boolean(meta.isPermanent) : Boolean(meta.isPermanent);
       const expiresAt =
         entry.isDirectory() || isPermanent ? null : getExpireAtISO(uploadedAt);
+      const isLocked = entry.isDirectory() ? Boolean(folderLocks[entryRelative]) : false;
 
       return {
         name: entry.name,
@@ -303,7 +304,10 @@ async function listDirectory(relativePath = "", metadata = {}) {
         uploaderIP: meta.uploaderIP || null,
         uploadedAt,
         expiresAt,
-        storageType: entry.isDirectory() ? "folder" : isPermanent ? "permanent" : "temporary",
+        storageType: entry.isDirectory()
+          ? isPermanent ? "permanent" : "folder"
+          : isPermanent ? "permanent" : "temporary",
+        isLocked,
       };
     })
   );
@@ -552,10 +556,38 @@ async function buildFolderZip(sourceAbsolute, destinationZipAbsolute) {
   throw new Error(`文件夹打包全部失败。${errors.join(" | ")}`);
 }
 
+// ── 密码哈希工具（SHA-256，不存明文）──────────────────────────────────────
+const crypto = require("crypto");
+
+function hashPassword(plain) {
+  return crypto.createHash("sha256").update(String(plain)).digest("hex");
+}
+
+// ── 递归收集目录下所有文件的相对路径 ──────────────────────────────────────
+async function collectAllFilesUnder(dirAbsolute, baseRelative) {
+  const results = [];
+  const entries = await fs.promises.readdir(dirAbsolute, { withFileTypes: true });
+  for (const entry of entries) {
+    const entryRelative = baseRelative ? `${baseRelative}/${entry.name}` : entry.name;
+    const entryAbsolute = path.join(dirAbsolute, entry.name);
+    if (entry.isDirectory()) {
+      const sub = await collectAllFilesUnder(entryAbsolute, entryRelative);
+      results.push(...sub);
+    } else {
+      results.push(entryRelative);
+    }
+  }
+  return results;
+}
+
 function createLanServer({ port, staticDir, serverInfoProvider }) {
   const app = express();
   const metadata = readJson(META_FILE, {});
   const clientProfiles = readJson(CLIENT_PROFILE_FILE, {});
+  // folderLocks: { [folderRelativePath]: { passwordHash: string, lockedAt: string } }
+  const folderLocks = readJson(FOLDER_LOCK_FILE, {});
+  // folderAccessTokens: Map<token, folderRelativePath> — 验证成功后颁发，内存级别
+  const folderAccessTokens = new Map();
 
   fs.promises.appendFile(LOG_FILE, "", "utf8").catch(() => {
     // noop
@@ -621,19 +653,63 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
     res.json({ ok: true, entries, total: serverLogBuffer.length });
   });
 
+  /**
+   * 从请求的 header（X-Folder-Tokens）或 query（folder_tokens）中解析已解锁文件夹路径集合
+   * 支持两种传递方式：header 适合 fetch/XHR，query 适合 <a href> 直接下载
+   */
+  function getUnlockedPaths(req) {
+    const fromHeader = String(req.headers["x-folder-tokens"] || "");
+    const fromQuery  = String(req.query.folder_tokens || "");
+    const raw = fromHeader || fromQuery;
+    const tokens = raw.split(",").map((t) => t.trim()).filter(Boolean);
+    const unlocked = new Set();
+    for (const t of tokens) {
+      const p = folderAccessTokens.get(t);
+      if (p) unlocked.add(p);
+    }
+    return unlocked;
+  }
+
+  /**
+   * 检查 targetRelativePath 是否被加密锁定。
+   * 返回被锁定的祖先路径字符串，未锁定返回 null。
+   */
+  function getLockedAncestor(targetRelativePath, unlockedPaths) {
+    const parts = toSafeRelative(targetRelativePath).split("/").filter(Boolean);
+    for (let i = 1; i <= parts.length; i++) {
+      const ancestor = parts.slice(0, i).join("/");
+      if (folderLocks[ancestor] && !unlockedPaths.has(ancestor)) {
+        return ancestor;
+      }
+    }
+    return null;
+  }
+
   app.get("/api/files", async (req, res) => {
     try {
       if (await cleanupExpiredTempFiles(metadata)) {
         writeJson(META_FILE, metadata);
       }
       const currentPath = String(req.query.path || "");
-      const files = await listDirectory(currentPath, metadata);
+      const info = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
+      const clientIP = getClientIP(req);
+      const isAdmin = isAdminClient(clientIP, info);
+      if (!isAdmin && currentPath) {
+        const unlockedPaths = getUnlockedPaths(req);
+        const locked = getLockedAncestor(currentPath, unlockedPaths);
+        if (locked) {
+          res.status(403).json({ ok: false, message: "该文件夹已加密，请先验证密码", locked: true, lockedPath: locked });
+          return;
+        }
+      }
+      const files = await listDirectory(currentPath, metadata, folderLocks);
       res.json({ ok: true, path: toSafeRelative(currentPath), files });
     } catch (error) {
       res.status(400).json({ ok: false, message: error.message });
     }
   });
 
+  // ── 升级永久存储（支持文件和文件夹含子级） ─────────────────────────────────
   app.post("/api/files/permanent", async (req, res) => {
     try {
       const info = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
@@ -645,35 +721,298 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
 
       const targetPath = toSafeRelative(String(req.body.path || ""));
       if (!targetPath) {
-        res.status(400).json({ ok: false, message: "文件路径不能为空" });
+        res.status(400).json({ ok: false, message: "路径不能为空" });
         return;
       }
 
       const { absolute } = resolveSafePath(targetPath);
       const stat = await fs.promises.stat(absolute);
-      if (!stat.isFile()) {
-        res.status(400).json({ ok: false, message: "仅支持文件升级为永久存储" });
+
+      if (stat.isFile()) {
+        // 单文件升级
+        const prev = metadata[targetPath] || {};
+        metadata[targetPath] = {
+          ...prev,
+          uploadedAt: prev.uploadedAt || stat.mtime.toISOString(),
+          isPermanent: true,
+          upgradedAt: new Date().toISOString(),
+        };
+        writeJson(META_FILE, metadata);
+        await appendAuditLog({
+          action: "升级永久",
+          clientIP,
+          userId: resolveActorUserId(clientProfiles, clientIP),
+          target: targetPath,
+          detail: "文件",
+        });
+        res.json({ ok: true, path: targetPath, storageType: "permanent" });
         return;
       }
 
-      const prev = metadata[targetPath] || {};
-      metadata[targetPath] = {
-        ...prev,
-        uploadedAt: prev.uploadedAt || stat.mtime.toISOString(),
-        isPermanent: true,
-        upgradedAt: new Date().toISOString(),
+      if (stat.isDirectory()) {
+        // 文件夹：升级文件夹本身元数据 + 递归升级所有子级文件
+        const folderMeta = metadata[targetPath] || {};
+        metadata[targetPath] = {
+          ...folderMeta,
+          isPermanent: true,
+          upgradedAt: new Date().toISOString(),
+        };
+
+        const allFiles = await collectAllFilesUnder(absolute, targetPath);
+        for (const filePath of allFiles) {
+          const prev = metadata[filePath] || {};
+          const fileStat = await fs.promises.stat(path.resolve(STORAGE_ROOT, filePath)).catch(() => null);
+          metadata[filePath] = {
+            ...prev,
+            uploadedAt: prev.uploadedAt || (fileStat ? fileStat.mtime.toISOString() : new Date().toISOString()),
+            isPermanent: true,
+            upgradedAt: new Date().toISOString(),
+          };
+        }
+        writeJson(META_FILE, metadata);
+        await appendAuditLog({
+          action: "升级永久",
+          clientIP,
+          userId: resolveActorUserId(clientProfiles, clientIP),
+          target: targetPath,
+          detail: `文件夹（含 ${allFiles.length} 个文件）`,
+        });
+        res.json({ ok: true, path: targetPath, storageType: "permanent", fileCount: allFiles.length });
+        return;
+      }
+
+      res.status(400).json({ ok: false, message: "目标既不是文件也不是文件夹" });
+    } catch (error) {
+      res.status(400).json({ ok: false, message: error.message || "升级永久存储失败" });
+    }
+  });
+
+  // ── 文件夹加密管理 ─────────────────────────────────────────────────────────
+  // GET  /api/folder-lock?path=xxx  — 查询文件夹加密状态
+  app.get("/api/folder-lock", (req, res) => {
+    const info = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
+    const clientIP = getClientIP(req);
+    const targetPath = toSafeRelative(String(req.query.path || ""));
+    if (!targetPath) {
+      res.status(400).json({ ok: false, message: "路径不能为空" });
+      return;
+    }
+    const lock = folderLocks[targetPath];
+    res.json({ ok: true, path: targetPath, isLocked: Boolean(lock), lockedAt: lock ? lock.lockedAt : null });
+  });
+
+  // POST /api/folder-lock  — 设置/更新加密密码（仅管理员）
+  app.post("/api/folder-lock", async (req, res) => {
+    try {
+      const info = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
+      const clientIP = getClientIP(req);
+      if (!isAdminClient(clientIP, info)) {
+        res.status(403).json({ ok: false, message: "仅管理员可设置文件夹密码" });
+        return;
+      }
+      const targetPath = toSafeRelative(String(req.body.path || ""));
+      const password = String(req.body.password || "").trim();
+      if (!targetPath) {
+        res.status(400).json({ ok: false, message: "路径不能为空" });
+        return;
+      }
+      if (!password) {
+        res.status(400).json({ ok: false, message: "密码不能为空" });
+        return;
+      }
+      const { absolute } = resolveSafePath(targetPath);
+      const stat = await fs.promises.stat(absolute);
+      if (!stat.isDirectory()) {
+        res.status(400).json({ ok: false, message: "只能对文件夹设置密码" });
+        return;
+      }
+      // 只允许对根目录下的直接子文件夹加密（路径中不包含 /）
+      if (targetPath.includes("/")) {
+        res.status(400).json({ ok: false, message: "只能对根目录下的直接子文件夹设置密码" });
+        return;
+      }
+      folderLocks[targetPath] = {
+        passwordHash: hashPassword(password),
+        lockedAt: new Date().toISOString(),
       };
-      writeJson(META_FILE, metadata);
+      writeJson(FOLDER_LOCK_FILE, folderLocks);
       await appendAuditLog({
-        action: "升级永久",
+        action: "文件夹加密",
         clientIP,
         userId: resolveActorUserId(clientProfiles, clientIP),
         target: targetPath,
       });
-
-      res.json({ ok: true, path: targetPath, storageType: "permanent" });
+      res.json({ ok: true, path: targetPath, isLocked: true });
     } catch (error) {
-      res.status(400).json({ ok: false, message: error.message || "升级永久存储失败" });
+      res.status(400).json({ ok: false, message: error.message || "设置密码失败" });
+    }
+  });
+
+  // DELETE /api/folder-lock?path=xxx  — 移除文件夹加密（仅管理员）
+  app.delete("/api/folder-lock", async (req, res) => {
+    try {
+      const info = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
+      const clientIP = getClientIP(req);
+      if (!isAdminClient(clientIP, info)) {
+        res.status(403).json({ ok: false, message: "仅管理员可解除文件夹密码" });
+        return;
+      }
+      const targetPath = toSafeRelative(String(req.query.path || ""));
+      if (!targetPath) {
+        res.status(400).json({ ok: false, message: "路径不能为空" });
+        return;
+      }
+      delete folderLocks[targetPath];
+      writeJson(FOLDER_LOCK_FILE, folderLocks);
+      await appendAuditLog({
+        action: "文件夹解密",
+        clientIP,
+        userId: resolveActorUserId(clientProfiles, clientIP),
+        target: targetPath,
+      });
+      res.json({ ok: true, path: targetPath, isLocked: false });
+    } catch (error) {
+      res.status(400).json({ ok: false, message: error.message || "解除密码失败" });
+    }
+  });
+
+  // POST /api/folder-lock/verify  — 验证文件夹密码（非管理员进入加密文件夹时）
+  // 验证成功后返回 accessToken，前端后续请求 /api/files 时在头部携带该 token
+  app.post("/api/folder-lock/verify", (req, res) => {
+    const targetPath = toSafeRelative(String(req.body.path || ""));
+    const password = String(req.body.password || "").trim();
+    if (!targetPath || !password) {
+      res.status(400).json({ ok: false, message: "路径和密码不能为空" });
+      return;
+    }
+    const lock = folderLocks[targetPath];
+    if (!lock) {
+      // 未加密文件夹，直接允许
+      const token = crypto.randomBytes(16).toString("hex");
+      folderAccessTokens.set(token, targetPath);
+      res.json({ ok: true, verified: true, accessToken: token, message: "该文件夹未加密" });
+      return;
+    }
+    const inputHash = hashPassword(password);
+    if (inputHash === lock.passwordHash) {
+      const token = crypto.randomBytes(16).toString("hex");
+      folderAccessTokens.set(token, targetPath);
+      res.json({ ok: true, verified: true, accessToken: token });
+    } else {
+      res.status(401).json({ ok: false, verified: false, message: "密码错误" });
+    }
+  });
+
+  // ── 文件预览接口 ─────────────────────────────────────────────────────────────
+  // GET /api/preview?path=xxx  — 流式返回文件内容（图片/视频直接代理，文档返回文本）
+  app.get("/api/preview", async (req, res) => {
+    try {
+      const targetPath = toSafeRelative(String(req.query.path || ""));
+      if (!targetPath) {
+        res.status(400).json({ ok: false, message: "路径不能为空" });
+        return;
+      }
+
+      // 检查是否被祖先文件夹锁定（支持 token 验证）
+      const info = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
+      const clientIP = getClientIP(req);
+      const isAdmin = isAdminClient(clientIP, info);
+      if (!isAdmin) {
+        const unlockedPaths = getUnlockedPaths(req);
+        const locked = getLockedAncestor(targetPath, unlockedPaths);
+        if (locked) {
+          res.status(403).json({ ok: false, message: "该文件夹已加密，请先验证密码", locked: true, lockedPath: locked });
+          return;
+        }
+      }
+
+      const { absolute } = resolveSafePath(targetPath);
+      const stat = await fs.promises.stat(absolute);
+      if (!stat.isFile()) {
+        res.status(400).json({ ok: false, message: "只能预览文件" });
+        return;
+      }
+
+      const ext = path.extname(absolute).slice(1).toLowerCase();
+
+      // 图片类型
+      const imageTypes = {
+        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+        gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+        bmp: "image/bmp", ico: "image/x-icon", avif: "image/avif",
+        tiff: "image/tiff", tif: "image/tiff",
+      };
+      // 视频类型
+      const videoTypes = {
+        mp4: "video/mp4", webm: "video/webm", ogg: "video/ogg",
+        mov: "video/quicktime", avi: "video/x-msvideo",
+        mkv: "video/x-matroska", flv: "video/x-flv",
+        m4v: "video/x-m4v", "3gp": "video/3gpp",
+      };
+      // 文本/文档类型（返回 UTF-8 文本）
+      const textTypes = ["txt", "md", "markdown", "log", "csv", "json", "xml",
+        "yaml", "yml", "toml", "ini", "conf", "cfg", "sh", "bat",
+        "js", "ts", "py", "java", "c", "cpp", "h", "css", "html",
+        "htm", "sql", "rs", "go", "rb", "php", "swift", "kt",
+      ];
+      // PDF
+      if (ext === "pdf") {
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Length", stat.size);
+        res.setHeader("Content-Disposition", "inline");
+        fs.createReadStream(absolute).pipe(res);
+        return;
+      }
+      if (imageTypes[ext]) {
+        res.setHeader("Content-Type", imageTypes[ext]);
+        res.setHeader("Content-Length", stat.size);
+        res.setHeader("Cache-Control", "public, max-age=60");
+        fs.createReadStream(absolute).pipe(res);
+        return;
+      }
+      if (videoTypes[ext]) {
+        // 支持 Range 请求（视频 seek）
+        const rangeHeader = req.headers.range;
+        const fileSize = stat.size;
+        if (rangeHeader) {
+          const parts = rangeHeader.replace(/bytes=/, "").split("-");
+          const start = parseInt(parts[0], 10);
+          const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+          const chunkSize = end - start + 1;
+          res.writeHead(206, {
+            "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": chunkSize,
+            "Content-Type": videoTypes[ext],
+          });
+          fs.createReadStream(absolute, { start, end }).pipe(res);
+        } else {
+          res.writeHead(200, {
+            "Content-Length": fileSize,
+            "Content-Type": videoTypes[ext],
+            "Accept-Ranges": "bytes",
+          });
+          fs.createReadStream(absolute).pipe(res);
+        }
+        return;
+      }
+      if (textTypes.includes(ext)) {
+        // 文本文件：限制最大 2MB 防止内存溢出
+        const MAX_TEXT_SIZE = 2 * 1024 * 1024;
+        if (stat.size > MAX_TEXT_SIZE) {
+          res.status(413).json({ ok: false, message: "文件过大，无法预览（最大 2MB）" });
+          return;
+        }
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        fs.createReadStream(absolute).pipe(res);
+        return;
+      }
+
+      // 不支持的类型
+      res.status(415).json({ ok: false, message: `不支持预览该格式（.${ext || "未知"}）`, unsupported: true });
+    } catch (error) {
+      const status = error && error.code === "ENOENT" ? 404 : 400;
+      res.status(status).json({ ok: false, message: error.message || "预览失败" });
     }
   });
 
@@ -1023,6 +1362,16 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
         res.status(400).json({ ok: false, message: "路径不能为空" });
         return;
       }
+      // 检查文件夹锁（非管理员需验证密码）
+      const zipInfo = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
+      if (!isAdminClient(clientIP, zipInfo)) {
+        const unlockedPaths = getUnlockedPaths(req);
+        const locked = getLockedAncestor(toSafeRelative(targetPath), unlockedPaths);
+        if (locked) {
+          res.status(403).json({ ok: false, message: "该文件夹已加密，无法下载", locked: true, lockedPath: locked });
+          return;
+        }
+      }
       const { absolute } = resolveSafePath(targetPath);
       console.log(`[API /api/zip] 解析绝对路径: "${absolute}"`);
 
@@ -1126,6 +1475,17 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
       const { absolute } = resolveSafePath(targetPath);
       const clientIP = getClientIP(req);
       const userId = resolveActorUserId(clientProfiles, clientIP);
+
+      // 检查文件夹锁（非管理员需验证密码才能下载加密文件夹内的文件）
+      const dlInfo = typeof serverInfoProvider === "function" ? serverInfoProvider() : {};
+      if (!isAdminClient(clientIP, dlInfo)) {
+        const unlockedPaths = getUnlockedPaths(req);
+        const locked = getLockedAncestor(toSafeRelative(targetPath), unlockedPaths);
+        if (locked) {
+          res.status(403).json({ ok: false, message: "该文件夹已加密，请先验证密码", locked: true, lockedPath: locked });
+          return;
+        }
+      }
 
       const stat = await fs.promises.stat(absolute);
       if (stat.isFile()) {

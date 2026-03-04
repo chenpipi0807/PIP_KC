@@ -13,6 +13,7 @@ const CONFIG_FILE = path.join(DATA_ROOT, "config.json");
 const META_FILE = path.join(DATA_ROOT, "file_meta.json");
 const CLIENT_PROFILE_FILE = path.join(DATA_ROOT, "client_profiles.json");
 const LOG_FILE = path.join(DATA_ROOT, "log.txt");
+const FOLDER_LOCK_FILE = path.join(DATA_ROOT, "folder_locks.json");
 
 function getLocalIPv4() {
   const interfaces = os.networkInterfaces();
@@ -131,6 +132,7 @@ module.exports = {
   META_FILE,
   CLIENT_PROFILE_FILE,
   LOG_FILE,
+  FOLDER_LOCK_FILE,
   ensureDirectories,
   loadConfig,
   saveConfig,
