@@ -594,7 +594,8 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
   });
 
   app.use(cors());
-  app.use(express.json());
+  // 剪切板图片粘贴时使用 base64 dataURL，体积可达数 MB；全局放宽 JSON 限制到 50MB
+  app.use(express.json({ limit: "50mb" }));
 
   if (staticDir) {
     app.use(express.static(staticDir));
@@ -1042,6 +1043,99 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
       res.json({ ok: true, folder: targetRelative });
     } catch (error) {
       res.status(400).json({ ok: false, message: error.message });
+    }
+  });
+
+  // ── 临时剪切板：粘贴文本/URL/图片 ──────────────────────────────────────────
+  // POST /api/clipboard/paste
+  // body: { type: 'text'|'url'|'image', content: string (text/url 直接内容, image 为 base64 dataURL) }
+  const CLIPBOARD_FOLDER = "📋临时剪切板";
+
+  // 确保剪切板文件夹存在
+  async function ensureClipboardFolder() {
+    const { absolute } = resolveSafePath(CLIPBOARD_FOLDER);
+    await fs.promises.mkdir(absolute, { recursive: true });
+    // 将文件夹本身标记为 permanent（文件夹不会过期）
+    if (!metadata[CLIPBOARD_FOLDER]) {
+      metadata[CLIPBOARD_FOLDER] = {
+        uploadedAt: new Date().toISOString(),
+        isPermanent: true,
+        uploader: "系统",
+        uploaderIP: "127.0.0.1",
+      };
+      writeJson(META_FILE, metadata);
+    }
+  }
+
+  app.post("/api/clipboard/paste", async (req, res) => {
+    try {
+      const { type, content } = req.body || {};
+      const clientIP = getClientIP(req);
+      const userId = resolveActorUserId(clientProfiles, clientIP);
+
+      if (!type || !content) {
+        res.status(400).json({ ok: false, message: "缺少 type 或 content 参数" });
+        return;
+      }
+      if (!["text", "url", "image"].includes(type)) {
+        res.status(400).json({ ok: false, message: "type 必须为 text/url/image" });
+        return;
+      }
+
+      await ensureClipboardFolder();
+
+      const now = new Date();
+      const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      let fileName, fileBuffer;
+
+      if (type === "image") {
+        // dataURL: data:image/png;base64,xxxx
+        const match = String(content).match(/^data:([^;]+);base64,(.+)$/s);
+        if (!match) {
+          res.status(400).json({ ok: false, message: "图片格式非法，需为 base64 dataURL" });
+          return;
+        }
+        const mime = match[1];
+        const ext = mime.split("/")[1]?.replace("jpeg", "jpg") || "png";
+        fileName = `图片-${ts}.${ext}`;
+        fileBuffer = Buffer.from(match[2], "base64");
+      } else if (type === "url") {
+        fileName = `链接-${ts}.url`;
+        // Windows .url 格式
+        fileBuffer = Buffer.from(`[InternetShortcut]\r\nURL=${content}\r\n`, "utf8");
+      } else {
+        fileName = `文本-${ts}.txt`;
+        fileBuffer = Buffer.from(String(content), "utf8");
+      }
+
+      // 确保不重名
+      const { absolute: dirAbs } = resolveSafePath(CLIPBOARD_FOLDER);
+      const { fileName: finalName, absolute: fileAbs } = await getUniqueFileTarget(dirAbs, fileName);
+      const fileRelative = `${CLIPBOARD_FOLDER}/${finalName}`;
+
+      await fs.promises.writeFile(fileAbs, fileBuffer);
+
+      metadata[fileRelative] = {
+        uploadedAt: now.toISOString(),
+        isPermanent: false,
+        uploader: userId,
+        uploaderIP: clientIP,
+        clipboardType: type,
+      };
+      writeJson(META_FILE, metadata);
+
+      await appendAuditLog({
+        action: "剪切板粘贴",
+        clientIP,
+        userId,
+        target: fileRelative,
+        detail: type,
+      });
+
+      res.json({ ok: true, path: fileRelative, name: finalName, type });
+    } catch (error) {
+      console.error("[clipboard/paste] error:", error);
+      res.status(500).json({ ok: false, message: error.message || "粘贴失败" });
     }
   });
 
@@ -1496,7 +1590,18 @@ function createLanServer({ port, staticDir, serverInfoProvider }) {
           target: toSafeRelative(targetPath),
           detail: "文件",
         });
-        res.download(absolute, path.basename(absolute));
+        // 强制使用 application/octet-stream + RFC 5987 编码文件名：
+        // 1. 避免 Chrome 对 HTTP 站点下载 .zip 等「危险类型」文件的安全拦截
+        // 2. 正确处理中文文件名（filename*=UTF-8'' 格式）
+        const encodedFileName = encodeURIComponent(path.basename(absolute));
+        res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodedFileName}`);
+        res.setHeader("Content-Type", "application/octet-stream");
+        res.setHeader("Content-Length", stat.size);
+        res.sendFile(absolute, { dotfiles: "allow" }, (err) => {
+          if (err) {
+            console.error(`[PIP_KuaiChuan] /api/download sendFile error: ${err.message}`);
+          }
+        });
         return;
       }
 

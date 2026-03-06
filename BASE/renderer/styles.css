@@ -1212,3 +1212,162 @@ th {
 .btn-lock-active:hover {
   background: #fde68a !important;
 }
+
+/* ── 临时剪切板按钮 ────────────────────────────────────────────────────────── */
+.btn-clipboard {
+  background: linear-gradient(135deg, #f0fdf4, #dcfce7);
+  color: #15803d;
+  border-color: #86efac;
+  font-weight: 600;
+}
+.btn-clipboard:hover {
+  background: linear-gradient(135deg, #dcfce7, #bbf7d0);
+  border-color: #4ade80;
+}
+
+/* 进入剪切板文件夹时，主区域顶部显示 Ctrl+V 提示横幅 */
+.clipboard-hint-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: linear-gradient(135deg, #f0fdf4, #dcfce7);
+  border: 1px solid #86efac;
+  border-radius: 10px;
+  padding: 10px 16px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: #15803d;
+  animation: clipboard-bar-in 0.3s ease;
+}
+@keyframes clipboard-bar-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.clipboard-hint-bar .cbhint-icon { font-size: 20px; }
+.clipboard-hint-bar .cbhint-kbd {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.clipboard-hint-bar kbd {
+  background: #fff;
+  border: 1px solid #86efac;
+  border-radius: 5px;
+  padding: 1px 7px;
+  font-size: 12px;
+  font-family: monospace;
+  color: #15803d;
+  box-shadow: 0 1px 0 #86efac;
+}
+
+/* ── 剪切板粘贴确认弹窗 ───────────────────────────────────────────────────── */
+.clipboard-paste-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+  animation: overlay-in 0.18s ease;
+}
+.clipboard-paste-overlay.hidden { display: none; }
+
+.clipboard-paste-dialog {
+  background: #fff;
+  border-radius: 18px;
+  padding: 32px 28px 24px;
+  min-width: 340px;
+  max-width: 480px;
+  width: 90vw;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.18);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  animation: dialog-in 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes dialog-in {
+  from { opacity: 0; transform: scale(0.88) translateY(16px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.clipboard-paste-icon { font-size: 36px; }
+.clipboard-paste-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.clipboard-paste-preview {
+  width: 100%;
+  max-height: 200px;
+  overflow: hidden;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #f8fafc;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.clipboard-paste-preview img {
+  max-width: 100%;
+  max-height: 200px;
+  object-fit: contain;
+  border-radius: 8px;
+}
+.clipboard-paste-preview pre {
+  margin: 0;
+  padding: 12px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+  width: 100%;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.clipboard-paste-preview .cp-url-icon {
+  font-size: 28px;
+  padding: 16px;
+}
+
+.clipboard-paste-info {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.clipboard-paste-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--primary);
+}
+.clipboard-paste-progress.hidden { display: none; }
+
+.clipboard-paste-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #bfdbfe;
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.clipboard-paste-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* 剪切板文件夹在文件列表中的特殊高亮行 */
+tr.clipboard-folder-row td:first-child,
+.file-grid-item.clipboard-folder-item .grid-name {
+  color: #15803d;
+  font-weight: 700;
+}

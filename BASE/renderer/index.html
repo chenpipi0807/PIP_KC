@@ -51,6 +51,7 @@
             <button id="downloadSelectedBtn" class="btn">下载选中(0)</button>
             <button id="refreshBtn" class="btn">刷新</button>
             <button id="toggleLogBtn" class="btn">查看日志</button>
+            <button id="clipboardFolderBtn" class="btn btn-clipboard" title="打开临时剪切板文件夹">📋 剪切板</button>
             <button id="upBtn" class="btn">上一级</button>
             <button id="newFolderBtn" class="btn">新建文件夹</button>
             <button id="uploadBtn" class="btn btn-primary">上传文件</button>
@@ -203,6 +204,24 @@
           <button id="adminLockConfirmBtn" class="btn btn-primary">设置密码</button>
           <button id="adminLockRemoveBtn" class="btn btn-danger hidden">解除加密</button>
           <button id="adminLockCancelBtn" class="btn">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 临时剪切板：Ctrl+V 粘贴提示浮层 ── -->
+    <div id="clipboardPasteOverlay" class="clipboard-paste-overlay hidden" role="dialog" aria-modal="true" aria-label="粘贴到剪切板">
+      <div class="clipboard-paste-dialog">
+        <div class="clipboard-paste-icon">📋</div>
+        <h3 class="clipboard-paste-title">粘贴到临时剪切板</h3>
+        <div id="clipboardPastePreview" class="clipboard-paste-preview"></div>
+        <p id="clipboardPasteInfo" class="clipboard-paste-info"></p>
+        <div id="clipboardPasteProgress" class="clipboard-paste-progress hidden">
+          <div class="clipboard-paste-spinner"></div>
+          <span>正在保存…</span>
+        </div>
+        <div class="clipboard-paste-actions">
+          <button id="clipboardPasteConfirmBtn" class="btn btn-primary">粘贴保存</button>
+          <button id="clipboardPasteCancelBtn" class="btn">取消</button>
         </div>
       </div>
     </div>

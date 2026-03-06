@@ -1106,6 +1106,8 @@ function renderListRows() {
       const selectDisabledAttr = isFile ? "" : "disabled";
       if (checked) rowClasses.push("is-selected");
       if (isFolder) rowClasses.push("drop-target-folder");
+      // 剪切板文件夹特殊高亮
+      if (isFolder && item.name === "📋临时剪切板") rowClasses.push("clipboard-folder-row");
 
       // 是否是根目录下的直接子文件夹（可加密/可永久）
       const isTopLevelFolder = isFolder && !item.path.includes("/");
@@ -1260,8 +1262,9 @@ function renderGridCards() {
              <span class="file-card-icon">${iconLabel}</span>
            </div>`;
 
+      const isClipboardFolder = isFolder && item.name === "📋临时剪切板";
       return `
-      <article class="file-card ${isFolder ? "drop-target-folder" : ""} ${checked ? "is-selected" : ""}" draggable="true" data-drag-path="${encodedPath}" data-drag-type="${item.type}"${dropAttrs}${folderOpenAttr}>
+      <article class="file-card ${isFolder ? "drop-target-folder" : ""} ${checked ? "is-selected" : ""} ${isClipboardFolder ? "clipboard-folder-item" : ""}" draggable="true" data-drag-path="${encodedPath}" data-drag-type="${item.type}"${dropAttrs}${folderOpenAttr}>
         <label class="file-card-check-wrap">
           <input class="entry-check" type="checkbox" data-select-path="${encodedPath}" ${checked} ${selectDisabledAttr} />
         </label>
@@ -1318,11 +1321,13 @@ async function refreshFiles() {
     syncSelectionWithCurrentFiles();
     renderBreadcrumb();
     renderFiles();
+    syncClipboardHintBar();
   } catch (error) {
     showToast(`目录刷新失败：${error.message}`, "error");
     state.files = [];
     syncSelectionWithCurrentFiles();
     renderFiles();
+    syncClipboardHintBar();
   }
 }
 
@@ -1920,6 +1925,9 @@ function bindEvents() {
 
   bindEntryContainer(els.fileTableBody);
   bindEntryContainer(els.fileGrid);
+
+  // 临时剪切板事件绑定
+  bindClipboardEvents();
 }
 
 async function bootstrap() {
@@ -1944,6 +1952,267 @@ async function bootstrap() {
 
   clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(refreshFiles, 4000);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 临时剪切板模块
+// ══════════════════════════════════════════════════════════════════════════════
+
+const CLIPBOARD_FOLDER_NAME = "📋临时剪切板";
+
+// 判断当前是否在剪切板文件夹
+function isInClipboardFolder() {
+  return state.currentPath === CLIPBOARD_FOLDER_NAME;
+}
+
+// 剪切板粘贴弹窗状态
+const clipboardState = {
+  pendingType: null,   // 'text' | 'url' | 'image'
+  pendingContent: null, // 文本内容或 dataURL
+  pendingText: null,   // 人类可读描述
+};
+
+// ── 弹窗 DOM 引用 ──
+const cbEls = {
+  overlay: document.getElementById("clipboardPasteOverlay"),
+  preview: document.getElementById("clipboardPastePreview"),
+  info: document.getElementById("clipboardPasteInfo"),
+  progress: document.getElementById("clipboardPasteProgress"),
+  confirmBtn: document.getElementById("clipboardPasteConfirmBtn"),
+  cancelBtn: document.getElementById("clipboardPasteCancelBtn"),
+};
+
+function showClipboardOverlay(type, content, label) {
+  clipboardState.pendingType = type;
+  clipboardState.pendingContent = content;
+  clipboardState.pendingText = label;
+
+  // 渲染预览
+  cbEls.preview.innerHTML = "";
+  if (type === "image") {
+    const img = document.createElement("img");
+    img.src = content;
+    img.alt = "粘贴图片预览";
+    cbEls.preview.appendChild(img);
+  } else if (type === "url") {
+    cbEls.preview.innerHTML = `<span class="cp-url-icon">🔗</span>`;
+    const pre = document.createElement("pre");
+    pre.textContent = content.slice(0, 300);
+    cbEls.preview.appendChild(pre);
+  } else {
+    const pre = document.createElement("pre");
+    pre.textContent = content.slice(0, 600);
+    cbEls.preview.appendChild(pre);
+  }
+
+  const typeLabel = type === "image" ? "图片" : type === "url" ? "网址链接" : "文本";
+  cbEls.info.textContent = `将保存为${typeLabel}到临时剪切板文件夹（24小时后自动清理，管理员可升级为永久）`;
+  cbEls.progress.classList.add("hidden");
+  cbEls.confirmBtn.disabled = false;
+  cbEls.overlay.classList.remove("hidden");
+}
+
+function hideClipboardOverlay() {
+  cbEls.overlay.classList.add("hidden");
+  clipboardState.pendingType = null;
+  clipboardState.pendingContent = null;
+}
+
+async function confirmClipboardPaste() {
+  const { pendingType, pendingContent } = clipboardState;
+  if (!pendingType || !pendingContent) return;
+
+  cbEls.progress.classList.remove("hidden");
+  cbEls.confirmBtn.disabled = true;
+
+  try {
+    await requestJson(`${baseUrl()}/api/clipboard/paste`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: pendingType, content: pendingContent }),
+    });
+    hideClipboardOverlay();
+    showToast("✅ 已粘贴到临时剪切板！", "success");
+    // 若当前在剪切板文件夹，立刻刷新
+    if (isInClipboardFolder()) {
+      await refreshFiles();
+    }
+  } catch (error) {
+    cbEls.progress.classList.add("hidden");
+    cbEls.confirmBtn.disabled = false;
+    showToast(`粘贴失败：${error.message}`, "error");
+  }
+}
+
+// 检测剪贴板内容类型并弹出确认窗
+async function handleClipboardPaste(event) {
+  // 仅在剪切板文件夹中生效
+  if (!isInClipboardFolder()) return;
+
+  // 避免在输入框/textarea 内触发
+  const activeTag = document.activeElement?.tagName?.toLowerCase();
+  if (activeTag === "input" || activeTag === "textarea") return;
+
+  // 优先从 ClipboardEvent 读取（键盘事件有此数据）
+  const clipData = event?.clipboardData || (navigator.clipboard ? null : null);
+
+  if (clipData) {
+    // 图片
+    const imageItem = Array.from(clipData.items || []).find(
+      (i) => i.kind === "file" && i.type.startsWith("image/")
+    );
+    if (imageItem) {
+      event.preventDefault();
+      const file = imageItem.getAsFile();
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        showClipboardOverlay("image", e.target.result, `图片 (${file.type})`);
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    // 文本
+    const text = clipData.getData("text/plain") || clipData.getData("text");
+    if (text) {
+      event.preventDefault();
+      const isUrl = /^https?:\/\//i.test(text.trim());
+      showClipboardOverlay(
+        isUrl ? "url" : "text",
+        text.trim(),
+        isUrl ? "网址" : "文本"
+      );
+      return;
+    }
+  }
+
+  // 无 clipboardData（如程序化触发），使用 Clipboard API 异步读取
+  if (navigator.clipboard) {
+    try {
+      // 先尝试读图片
+      const items = await navigator.clipboard.read().catch(() => []);
+      for (const item of items) {
+        const imageType = item.types.find((t) => t.startsWith("image/"));
+        if (imageType) {
+          const blob = await item.getType(imageType);
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            showClipboardOverlay("image", e.target.result, `图片 (${imageType})`);
+          };
+          reader.readAsDataURL(blob);
+          return;
+        }
+        if (item.types.includes("text/plain")) {
+          const blob = await item.getType("text/plain");
+          const text = await blob.text();
+          if (text) {
+            const isUrl = /^https?:\/\//i.test(text.trim());
+            showClipboardOverlay(
+              isUrl ? "url" : "text",
+              text.trim(),
+              isUrl ? "网址" : "文本"
+            );
+            return;
+          }
+        }
+      }
+      // fallback: readText
+      const text = await navigator.clipboard.readText().catch(() => "");
+      if (text) {
+        const isUrl = /^https?:\/\//i.test(text.trim());
+        showClipboardOverlay(
+          isUrl ? "url" : "text",
+          text.trim(),
+          isUrl ? "网址" : "文本"
+        );
+      } else {
+        showToast("剪贴板为空或无可粘贴内容", "error");
+      }
+    } catch {
+      showToast("无法读取剪贴板（请确认浏览器已授权）", "error");
+    }
+  } else {
+    showToast("当前浏览器不支持剪贴板读取", "error");
+  }
+}
+
+// 跳转到剪切板文件夹（若不存在则先创建）
+async function openClipboardFolder() {
+  try {
+    // 尝试创建文件夹（已存在时服务端 mkdir recursive 不会报错）
+    await requestJson(`${baseUrl()}/api/folders`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: "", name: CLIPBOARD_FOLDER_NAME }),
+    }).catch(() => {/* 已存在则忽略 */});
+
+    state.currentPath = CLIPBOARD_FOLDER_NAME;
+    await refreshFiles();
+    showToast("📋 进入临时剪切板 — 按 Ctrl+V 快速粘贴", "success");
+  } catch (error) {
+    showToast(`打开剪切板失败：${error.message}`, "error");
+  }
+}
+
+// 在文件列表顶部插入/移除 Ctrl+V 提示横幅
+function syncClipboardHintBar() {
+  const existing = document.getElementById("clipboardHintBar");
+  if (isInClipboardFolder()) {
+    if (!existing) {
+      const bar = document.createElement("div");
+      bar.id = "clipboardHintBar";
+      bar.className = "clipboard-hint-bar";
+      bar.innerHTML = `
+        <span class="cbhint-icon">📋</span>
+        <span>临时剪切板文件夹 — 按 <span class="cbhint-kbd"><kbd>Ctrl</kbd>+<kbd>V</kbd></span> 快速粘贴文本、网址或图片</span>
+      `;
+      // 插入到 breadcrumb 后面
+      const breadcrumb = document.getElementById("breadcrumb");
+      if (breadcrumb && breadcrumb.parentNode) {
+        breadcrumb.parentNode.insertBefore(bar, breadcrumb.nextSibling);
+      }
+    }
+  } else {
+    if (existing) existing.remove();
+  }
+}
+
+// 绑定剪切板事件
+function bindClipboardEvents() {
+  // 剪切板文件夹入口按钮
+  const clipboardFolderBtn = document.getElementById("clipboardFolderBtn");
+  if (clipboardFolderBtn) {
+    clipboardFolderBtn.addEventListener("click", openClipboardFolder);
+  }
+
+  // Ctrl+V 全局监听（仅在剪切板文件夹内生效）
+  document.addEventListener("paste", (event) => {
+    handleClipboardPaste(event);
+  });
+
+  // 弹窗：确认粘贴
+  if (cbEls.confirmBtn) {
+    cbEls.confirmBtn.addEventListener("click", confirmClipboardPaste);
+  }
+
+  // 弹窗：取消
+  if (cbEls.cancelBtn) {
+    cbEls.cancelBtn.addEventListener("click", hideClipboardOverlay);
+  }
+
+  // 点击遮罩关闭
+  if (cbEls.overlay) {
+    cbEls.overlay.addEventListener("click", (e) => {
+      if (e.target === cbEls.overlay) hideClipboardOverlay();
+    });
+  }
+
+  // ESC 关闭
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && cbEls.overlay && !cbEls.overlay.classList.contains("hidden")) {
+      hideClipboardOverlay();
+    }
+  });
 }
 
 bootstrap().catch((error) => {
